@@ -150,7 +150,13 @@ func analyzeIOStatLog(log *iostat.IOStatLog, opts analysisOptions) error {
 	}
 
 	rawMetrics := output.ConvertIOStatData(log, startTime, endTime)
-	filename := fmt.Sprintf("iostat_%s.csv", time.Now().Format("20060102150405"))
+	
+	ext := "csv"
+	if opts.outputFormat == "html" {
+		ext = "html"
+	}
+	
+	filename := fmt.Sprintf("iostat_%s.%s", time.Now().Format("20060102150405"), ext)
 	return formatter.OutputIOStatData(rawMetrics, filename)
 }
 
@@ -273,7 +279,13 @@ func analyzeMemInfoLog(log *meminfo.MemInfoLog, opts analysisOptions, timeLayout
 	}
 
 	rawMetrics := output.ConvertMemInfoData(log, startTime, endTime)
-	filename := fmt.Sprintf("meminfo_%s.csv", time.Now().Format("20060102150405"))
+	
+	ext := "csv"
+	if opts.outputFormat == "html" {
+		ext = "html"
+	}
+
+	filename := fmt.Sprintf("meminfo_%s.%s", time.Now().Format("20060102150405"), ext)
 	return formatter.OutputMemInfoData(rawMetrics, filename)
 }
 

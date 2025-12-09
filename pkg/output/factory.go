@@ -9,6 +9,8 @@ func CreateFormatter(format string) (OutputFormatter, error) {
 		return NewCSVFormatter(), nil
 	case "json":
 		return NewJSONFormatter(), nil
+	case "html":
+		return NewHTMLFormatter(), nil
 	default:
 		return nil, fmt.Errorf("不支持的输出格式: %s", format)
 	}

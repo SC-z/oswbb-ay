@@ -13,7 +13,7 @@ func main() {
 	startTimeStr := flag.String("start", "", "开始时间 (格式: 2006-01-02 15:04:05)")
 	endTimeStr := flag.String("end", "", "结束时间 (格式: 2006-01-02 15:04:05)")
 	singleMode := flag.Bool("s", false, "单文件模式: 每个文件独立解析报告 (默认: 同类文件合并分析)")
-	outputFormat := flag.String("o", "report", "输出格式: report(默认报告), csv, json, ml")
+	outputFormat := flag.String("o", "report", "输出格式: report(默认报告), csv, json, ml, html")
 	flag.Parse()
 
 	if *inputFile == "" {
