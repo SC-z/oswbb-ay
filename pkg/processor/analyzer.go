@@ -30,7 +30,6 @@ const (
 	memAvailWarnMB          = 16384.0 // 16GB
 
 	memSwapSeverePct        = 10.0
-	memDentryPctThreshold   = 2.0
 	memUnreclaimPctThresh   = 2.0
 
 	// Slab 告警配置
@@ -130,8 +129,13 @@ func printIntro(lines []string, leadingBlank bool) {
 	fmt.Println()
 }
 
-// analyzeIOStatLog 根据配置分析 iostat 日志
-func analyzeIOStatLog(log *iostat.IOStatLog, opts analysisOptions) error {
+// executeAnalysisTemplate 执行通用的分析流程
+func executeAnalysisTemplate(
+	log timeRangedLog,
+	opts analysisOptions,
+	reportAction func(start, end time.Time),
+	exportAction func(start, end time.Time, formatter output.OutputFormatter) error,
+) error {
 	startTime, endTime, usedDefault, err := resolveTimeRange(log, opts.startTimeStr, opts.endTimeStr, opts.location)
 	if err != nil {
 		return err
@@ -140,7 +144,7 @@ func analyzeIOStatLog(log *iostat.IOStatLog, opts analysisOptions) error {
 	if opts.outputFormat == outputFormatReport {
 		printTimeRangeNotice(opts.rangeScope, usedDefault, startTime, endTime)
 		printIntro(opts.introLines, opts.leadingBlankIntro)
-		printIOStatReport(log, startTime, endTime)
+		reportAction(startTime, endTime)
 		return nil
 	}
 
@@ -149,16 +153,29 @@ func analyzeIOStatLog(log *iostat.IOStatLog, opts analysisOptions) error {
 		return err
 	}
 
-	rawMetrics := output.ConvertIOStatData(log, startTime, endTime)
-	
-	ext := "csv"
-	if opts.outputFormat == "html" {
-		ext = "html"
-	}
-	
-	filename := fmt.Sprintf("iostat_%s.%s", time.Now().Format("20060102150405"), ext)
-	return formatter.OutputIOStatData(rawMetrics, filename)
+	return exportAction(startTime, endTime, formatter)
 }
+
+// analyzeIOStatLog 根据配置分析 iostat 日志
+func analyzeIOStatLog(log *iostat.IOStatLog, opts analysisOptions) error {
+	return executeAnalysisTemplate(log, opts,
+		func(start, end time.Time) {
+			printIOStatReport(log, start, end)
+		},
+		func(start, end time.Time, formatter output.OutputFormatter) error {
+			rawMetrics := output.ConvertIOStatData(log, start, end)
+
+			ext := "csv"
+			if opts.outputFormat == "html" {
+				ext = "html"
+			}
+
+			filename := fmt.Sprintf("iostat_%s.%s", time.Now().Format("20060102150405"), ext)
+			return formatter.OutputIOStatData(rawMetrics, filename)
+		},
+	)
+}
+
 
 // printIOStatReport 打印 iostat 报告模式详情
 func printIOStatReport(log *iostat.IOStatLog, startTime, endTime time.Time) {
@@ -261,32 +278,22 @@ func logParseErrors(errs []error) {
 
 // analyzeMemInfoLog 根据配置分析 meminfo 日志
 func analyzeMemInfoLog(log *meminfo.MemInfoLog, opts analysisOptions, timeLayout string) error {
-	startTime, endTime, usedDefault, err := resolveTimeRange(log, opts.startTimeStr, opts.endTimeStr, opts.location)
-	if err != nil {
-		return err
-	}
+	return executeAnalysisTemplate(log, opts,
+		func(start, end time.Time) {
+			printMemInfoReport(log, start, end, timeLayout)
+		},
+		func(start, end time.Time, formatter output.OutputFormatter) error {
+			rawMetrics := output.ConvertMemInfoData(log, start, end)
 
-	if opts.outputFormat == outputFormatReport {
-		printTimeRangeNotice(opts.rangeScope, usedDefault, startTime, endTime)
-		printIntro(opts.introLines, opts.leadingBlankIntro)
-		printMemInfoReport(log, startTime, endTime, timeLayout)
-		return nil
-	}
+			ext := "csv"
+			if opts.outputFormat == "html" {
+				ext = "html"
+			}
 
-	formatter, err := output.CreateFormatter(opts.outputFormat)
-	if err != nil {
-		return err
-	}
-
-	rawMetrics := output.ConvertMemInfoData(log, startTime, endTime)
-	
-	ext := "csv"
-	if opts.outputFormat == "html" {
-		ext = "html"
-	}
-
-	filename := fmt.Sprintf("meminfo_%s.%s", time.Now().Format("20060102150405"), ext)
-	return formatter.OutputMemInfoData(rawMetrics, filename)
+			filename := fmt.Sprintf("meminfo_%s.%s", time.Now().Format("20060102150405"), ext)
+			return formatter.OutputMemInfoData(rawMetrics, filename)
+		},
+	)
 }
 
 // printMemInfoReport 打印 meminfo 报告模式详情（短期/长期窗口对比 + 突变检测）
@@ -318,7 +325,6 @@ func printMemInfoReport(log *meminfo.MemInfoLog, startTime, endTime time.Time, t
 		swapPct = pct(swapUsed, float64(latest.MemStats.SwapTotal))
 	}
 	unreclaimPct := pct(float64(latest.MemStats.SUnreclaim), memTotalKB)
-	dentryPct := pct(float64(latest.MemStats.Dentry), memTotalKB)
 
 	memTotalMBVal := memTotalKB / 1024.0
 
@@ -343,21 +349,20 @@ func printMemInfoReport(log *meminfo.MemInfoLog, startTime, endTime time.Time, t
 	slabStatus := classifySlab(slabMB, slabPct)
 	unreclaimStatus := classifyUnreclaim(unreclaimPct, slabStats.slopeShort)
 	
-	dentryStatus := classifyDentry(dentryPct, latest.MemStats.Dentry)
-
 	swapUsageStatus := classifySwapUsage(latest.MemStats.SwapFree, latest.MemStats.SwapTotal, swapPct, availPct)
 	deltaSwapPct := swapDeltaPct(shortWin, latest.MemStats.SwapTotal)
+	
+	// Swap 异常检测
+	var swapAnomalies []common.TrendAnomaly
 	swapBurst := "无"
 	var swapChangeTime time.Time
+	
 	if latest.MemStats.SwapTotal > 0 {
-		// 计算 Swap 激增的斜率阈值: 短窗口内变化超过 memSwapBurstPct (20%)
-		// 阈值 = (TotalMB * 20%) / 36
 		swapTotalMB := float64(latest.MemStats.SwapTotal) / 1024.0
 		swapThreshold := (swapTotalMB * (memSwapBurstPct / 100.0)) / float64(memShortWindow)
-
-		// SwapFree 骤降意味着 Swap 使用激增
-		sAnomalies := findSignificantTrendChange(data, func(ms meminfo.MemStats) float64 { return float64(ms.SwapFree) }, swapThreshold, memTotalMBVal)
-		for _, anomaly := range sAnomalies {
+		swapAnomalies = findSignificantTrendChange(data, func(ms meminfo.MemStats) float64 { return float64(ms.SwapFree) }, swapThreshold, memTotalMBVal)
+		
+		for _, anomaly := range swapAnomalies {
 			if anomaly.Type == "骤降(单点)" || anomaly.Type == "骤降(趋势)" {
 				swapBurst = "Swap 激增"
 				swapChangeTime = anomaly.Time
@@ -389,7 +394,6 @@ func printMemInfoReport(log *meminfo.MemInfoLog, startTime, endTime time.Time, t
 		fmt.Println()
 	}
 	fmt.Printf("- Slab: %.2f GB (不可回收 %.2f GB，可回收 %.2f GB)\n", kbToGB(float64(latest.MemStats.Slab)), kbToGB(float64(latest.MemStats.SUnreclaim)), kbToGB(float64(latest.MemStats.SReclaimable)))
-	fmt.Printf("- dentry: %s (占比 %.2f%%)\n", formatKBValue(float64(latest.MemStats.Dentry)), dentryPct)
 	fmt.Printf("- 内核栈/PageTables/Percpu: %.2f/%.2f/%.2f MB\n\n", kbToMB(float64(latest.MemStats.KernelStack)), kbToMB(float64(latest.MemStats.PageTables)), kbToMB(float64(latest.MemStats.Percpu)))
 
 	fmt.Println("[告警与趋势]")
@@ -399,8 +403,6 @@ func printMemInfoReport(log *meminfo.MemInfoLog, startTime, endTime time.Time, t
 		anonStatus, anonDeltaMB, anonRateMB, formatAnomalies(anonAnomalies, timeLayout))
 	fmt.Printf("- Slab/Unreclaim: %s / %s；SUnreclaim占比 %.2f %%; 突变: %s\n",
 		slabStatus, unreclaimStatus, unreclaimPct, formatAnomalies(slabAnomalies, timeLayout))
-	fmt.Printf("- dentry: %s；大小 %s (占比 %.2f%%)\n",
-		dentryStatus, formatKBValue(float64(latest.MemStats.Dentry)), dentryPct)
 	fmt.Printf("- Swap 使用: %s；SwapPct=%.1f%%；短窗变化 %.1f%%；突发: %s @ %s\n",
 		swapUsageStatus, swapPct, deltaSwapPct, swapBurst, formatTimeOrDash(swapChangeTime, timeLayout))
 	fmt.Printf("- 内核栈/页表/Percpu: %s；短窗增幅( MB ): %.1f/%.1f/%.1f\n",
@@ -417,9 +419,8 @@ func printMemInfoReport(log *meminfo.MemInfoLog, startTime, endTime time.Time, t
 	fmt.Println("2) 匿名页 (AnonPages)")
 	fmt.Printf("   当前: %.2f GB；短窗增量 %.1f MB；平均变化 %.1f MB/点\n\n", kbToGB(anonStats.current), anonDeltaMB, anonRateMB)
 
-	fmt.Println("3) Slab / dentry")
-	fmt.Printf("   Slab: %.2f GB；SUnreclaim %.2f GB (%.2f%%)；SReclaimable %.2f GB\n", kbToGB(float64(latest.MemStats.Slab)), kbToGB(float64(latest.MemStats.SUnreclaim)), unreclaimPct, kbToGB(float64(latest.MemStats.SReclaimable)))
-	fmt.Printf("   dentry: %s (%.2f%%)\n\n", formatKBValue(float64(latest.MemStats.Dentry)), dentryPct)
+	fmt.Println("3) Slab")
+	fmt.Printf("   Slab: %.2f GB；SUnreclaim %.2f GB (%.2f%%)；SReclaimable %.2f GB\n\n", kbToGB(float64(latest.MemStats.Slab)), kbToGB(float64(latest.MemStats.SUnreclaim)), unreclaimPct, kbToGB(float64(latest.MemStats.SReclaimable)))
 
 	fmt.Println("4) Swap")
 	fmt.Printf("   当前: %.2f/%.2f GB (%.1f%%)\n", kbToGB(swapStats.current), kbToGB(float64(latest.MemStats.SwapTotal)), swapPct)
@@ -438,21 +439,10 @@ func printMemInfoReport(log *meminfo.MemInfoLog, startTime, endTime time.Time, t
 	anomalyCategories["可用内存 (Available)"] = availAnomalies
 	anomalyCategories["匿名页 (AnonPages)"] = anonAnomalies
 	anomalyCategories["Slab"] = slabAnomalies
-	
-	// 收集 Swap 异常 (如果是上面局部变量定义的，这里可能访问不到，需要修正逻辑)
-	// 为了简单，这里重新计算或确保 sAnomalies 可用。
-	// 回看代码，sAnomalies 是在 if 块里定义的。
-	// 最好的办法是提取 sAnomalies 定义到 if 外面。
-	var swapAnomalies []common.TrendAnomaly
-	if latest.MemStats.SwapTotal > 0 {
-		// 这里的阈值计算逻辑需要重复一下或者提前算好
-		swapTotalMB := float64(latest.MemStats.SwapTotal) / 1024.0
-		swapThreshold := (swapTotalMB * (memSwapBurstPct / 100.0)) / float64(memShortWindow)
-		swapAnomalies = findSignificantTrendChange(data, func(ms meminfo.MemStats) float64 { return float64(ms.SwapFree) }, swapThreshold, memTotalMBVal)
-	}
 	anomalyCategories["Swap"] = swapAnomalies
 
 	printAnomalyDetailList(anomalyCategories, timeLayout)
+
 }
 
 // mergeMemInfoFiles 解析并合并多个 meminfo 文件
@@ -944,44 +934,6 @@ func findSignificantTrendChange(data []meminfo.MemStatData, extractor func(memin
 	return anomalies
 }
 
-// detectTrendChange 识别短期与长期斜率差异
-func detectTrendChange(stats memSeriesStats, threshold float64, win []meminfo.MemStatData) (string, time.Time) {
-	if len(win) == 0 {
-		return "无", time.Time{}
-	}
-
-	start := win[0].Timestamp
-	end := win[len(win)-1].Timestamp
-
-	if len(win) >= 2 {
-		diff := stats.slopeShort - stats.slopeLong
-		if diff > threshold {
-			return "骤升", start
-		}
-		if diff < -threshold {
-			return "骤降", start
-		}
-	}
-
-	if stats.zScore >= 3 {
-		return "骤升", end
-	}
-	if stats.zScore <= -3 {
-		return "骤降", end
-	}
-
-	if stats.mad > 0 {
-		deviation := math.Abs(stats.current - stats.meanLong)
-		if deviation > 3*stats.mad {
-			if stats.current >= stats.meanLong {
-				return "骤升", end
-			}
-			return "骤降", end
-		}
-	}
-
-	return "无", time.Time{}
-}
 
 // deltaMB 计算窗口首尾差值 (MB)
 func deltaMB(win []meminfo.MemStatData, extractor func(meminfo.MemStats) float64) float64 {
@@ -1049,17 +1001,6 @@ func classifyUnreclaim(unreclaimPct, slope float64) string {
 	}
 	if slope > 0 {
 		return "告警"
-	}
-	return "正常"
-}
-
-// classifyDentry 判定 dentry 泄漏
-func classifyDentry(dentryPct float64, dentryKB int64) string {
-	if dentryPct > memDentryPctThreshold {
-		return "dentry 泄漏"
-	}
-	if dentryKB > 0 {
-		return "正常"
 	}
 	return "正常"
 }

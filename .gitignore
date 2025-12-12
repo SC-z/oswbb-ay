@@ -16,3 +16,5 @@ oswatcher_analyzer.py
 main.py
 test.py
 oswbb-analyse
+*.dat
+*.gz
