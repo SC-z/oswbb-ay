@@ -18,3 +18,5 @@ test.py
 oswbb-analyse
 *.dat
 *.gz
+.DS_Store
+.python-version

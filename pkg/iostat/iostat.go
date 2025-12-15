@@ -49,6 +49,9 @@ type DeviceStats struct {
 	WriteAwait       float64 `json:"w_await"`
 	WriteReqSize     float64 `json:"wareq_sz"`
 
+	// 平均请求大小（可选字段，缺失时为nil）
+	AvgReqSize *float64 `json:"avgrq_sz,omitempty"`
+
 	// 丢弃操作指标
 	DiscardReqPerSec   float64 `json:"d_s"`
 	DiscardKBPerSec    float64 `json:"dkb_s"`
@@ -69,7 +72,10 @@ type IOStatLog struct {
 }
 
 // IOStatParser 解析器
-type IOStatParser struct{}
+type IOStatParser struct {
+	// headerIndex 保存当前设备表头的列名 -> 字段索引（设备行 fields 的索引）
+	headerIndex map[string]int
+}
 
 // ParseFile 解析iostat文件
 func (p *IOStatParser) ParseFile(filename string) (*IOStatLog, error) {
@@ -120,7 +126,8 @@ func (p *IOStatParser) ParseFile(filename string) (*IOStatLog, error) {
 			}
 
 		case strings.HasPrefix(line, "Device"):
-			// 跳过设备表头
+			// 解析并缓存设备表头
+			p.parseDeviceHeader(line)
 			continue
 
 		case line != "" && !strings.Contains(line, "avg-cpu") && currentSnapshot != nil:
@@ -138,6 +145,150 @@ func (p *IOStatParser) ParseFile(filename string) (*IOStatLog, error) {
 	}
 
 	return log, scanner.Err()
+}
+
+// normalizeHeaderKey 将表头列名规范化为统一key
+func normalizeHeaderKey(raw string) string {
+	key := strings.ToLower(strings.TrimSpace(raw))
+	key = strings.TrimSuffix(key, ":")
+	key = strings.ReplaceAll(key, "_", "-")
+	return key
+}
+
+// parseDeviceHeader 解析 Device 表头，建立列名索引映射
+func (p *IOStatParser) parseDeviceHeader(line string) {
+	fields := strings.Fields(line)
+	if len(fields) < 2 {
+		p.headerIndex = nil
+		return
+	}
+
+	index := make(map[string]int)
+	cols := fields[1:] // 去掉"Device"
+	for i, col := range cols {
+		key := normalizeHeaderKey(col)
+		if key == "" {
+			continue
+		}
+		// 设备行 fields[0] 是设备名，cols[0] 对应 fields[1]
+		index[key] = i + 1
+	}
+	p.headerIndex = index
+}
+
+// getFieldFloat 从设备行按列名获取 float 值
+func (p *IOStatParser) getFieldFloat(fields []string, keys ...string) (float64, bool) {
+	if p.headerIndex == nil {
+		return 0, false
+	}
+	for _, rawKey := range keys {
+		key := normalizeHeaderKey(rawKey)
+		idx, ok := p.headerIndex[key]
+		if !ok || idx >= len(fields) {
+			continue
+		}
+		val, err := strconv.ParseFloat(fields[idx], 64)
+		if err != nil {
+			continue
+		}
+		return val, true
+	}
+	return 0, false
+}
+
+// fillDeviceStatsFromHeader 按表头驱动填充字段，返回是否解析到任意关心字段
+func (p *IOStatParser) fillDeviceStatsFromHeader(fields []string, device *DeviceStats) bool {
+	parsedAny := false
+
+	if val, ok := p.getFieldFloat(fields, "r/s"); ok {
+		device.ReadReqPerSec = val
+		parsedAny = true
+	}
+	if val, ok := p.getFieldFloat(fields, "w/s"); ok {
+		device.WriteReqPerSec = val
+		parsedAny = true
+	}
+	if val, ok := p.getFieldFloat(fields, "rkB/s", "rkb/s"); ok {
+		device.ReadKBPerSec = val
+		parsedAny = true
+	}
+	if val, ok := p.getFieldFloat(fields, "wkB/s", "wkb/s"); ok {
+		device.WriteKBPerSec = val
+		parsedAny = true
+	}
+	if val, ok := p.getFieldFloat(fields, "rrqm/s"); ok {
+		device.ReadMergePerSec = val
+		parsedAny = true
+	}
+	if val, ok := p.getFieldFloat(fields, "wrqm/s"); ok {
+		device.WriteMergePerSec = val
+		parsedAny = true
+	}
+
+	// await：优先 r_await / w_await，缺失时用 await 兜底
+	readAwait, okReadAwait := p.getFieldFloat(fields, "r_await")
+	writeAwait, okWriteAwait := p.getFieldFloat(fields, "w_await")
+	if !okReadAwait || !okWriteAwait {
+		if await, okAwait := p.getFieldFloat(fields, "await"); okAwait {
+			if !okReadAwait {
+				readAwait = await
+				okReadAwait = true
+			}
+			if !okWriteAwait {
+				writeAwait = await
+				okWriteAwait = true
+			}
+		}
+	}
+	if okReadAwait {
+		device.ReadAwait = readAwait
+		parsedAny = true
+	}
+	if okWriteAwait {
+		device.WriteAwait = writeAwait
+		parsedAny = true
+	}
+
+	if val, ok := p.getFieldFloat(fields, "aqu-sz", "avgqu-sz"); ok {
+		device.AvgQueueSize = val
+		parsedAny = true
+	}
+
+	// 请求大小：仅在 avgrq-sz 存在时采集，否则保持 nil
+	if val, ok := p.getFieldFloat(fields, "avgrq-sz"); ok {
+		device.AvgReqSize = &val
+		parsedAny = true
+	}
+
+	// 读/写平均请求大小（可选）
+	if val, ok := p.getFieldFloat(fields, "rareq-sz"); ok {
+		device.ReadReqSize = val
+	}
+	if val, ok := p.getFieldFloat(fields, "wareq-sz"); ok {
+		device.WriteReqSize = val
+	}
+
+	// discard 等其他字段按需解析（不影响 parsedAny）
+	if val, ok := p.getFieldFloat(fields, "d/s"); ok {
+		device.DiscardReqPerSec = val
+	}
+	if val, ok := p.getFieldFloat(fields, "dkB/s", "dkb/s"); ok {
+		device.DiscardKBPerSec = val
+	}
+	if val, ok := p.getFieldFloat(fields, "drqm/s"); ok {
+		device.DiscardMergePerSec = val
+	}
+	if val, ok := p.getFieldFloat(fields, "%drqm"); ok {
+		device.DiscardMergePct = val
+	}
+	if val, ok := p.getFieldFloat(fields, "d_await"); ok {
+		device.DiscardAwait = val
+	}
+	if val, ok := p.getFieldFloat(fields, "dareq-sz"); ok {
+		device.DiscardReqSize = val
+	}
+
+	return parsedAny
 }
 
 // parseTimestamp 解析时间戳
@@ -201,8 +352,8 @@ func (p *IOStatParser) parseCPUStats(line string) (CPUStats, error) {
 // parseDeviceStats 解析设备统计 - 兼容不同格式
 func (p *IOStatParser) parseDeviceStats(line string) (DeviceStats, error) {
 	fields := strings.Fields(line)
-	if len(fields) < 15 {
-		return DeviceStats{}, fmt.Errorf("Abnormal raw data: expected at least 15 fields, got %d", len(fields))
+	if len(fields) < 2 {
+		return DeviceStats{}, fmt.Errorf("invalid device stats line")
 	}
 
 	// 跳过RAID设备(md*)
@@ -214,6 +365,13 @@ func (p *IOStatParser) parseDeviceStats(line string) (DeviceStats, error) {
 
 	device := DeviceStats{
 		Device: deviceName,
+	}
+
+	// 优先按表头驱动解析（适配不同版本/列数变化）
+	if p.headerIndex != nil {
+		if parsed := p.fillDeviceStatsFromHeader(fields, &device); parsed {
+			return device, nil
+		}
 	}
 
 	// 根据字段数量判断格式

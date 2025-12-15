@@ -158,6 +158,7 @@ const htmlTemplate = `<!DOCTYPE html>
                 { key: 'read_await', name: '读延迟 (ms)' },
                 { key: 'write_await', name: '写延迟 (ms)' },
                 { key: 'avg_queue_size', name: '平均队列深度 (avgqu-sz)' },
+                { key: 'avg_req_size', name: '平均请求大小 (avgrq-sz)' },
                 { key: 'read_merge_per_sec', name: '读合并/秒 (rrqm/s)' },
                 { key: 'write_merge_per_sec', name: '写合并/秒 (wrqm/s)' }
             ];

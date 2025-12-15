@@ -37,6 +37,7 @@ type IOStatRawMetrics struct {
 	ReadAwait    float64 `json:"read_await" csv:"read_await"`
 	WriteAwait   float64 `json:"write_await" csv:"write_await"`
 	AvgQueueSize float64 `json:"avg_queue_size" csv:"avg_queue_size"`
+	AvgReqSize   *float64 `json:"avg_req_size" csv:"avg_req_size"`
 	// Utilization      float64 `json:"utilization" csv:"utilization"`
 }
 
@@ -113,6 +114,7 @@ func createIOStatMetrics(timestamp string, data *iostat.IOStatData, device *iost
 		ReadAwait:        device.ReadAwait,
 		WriteAwait:       device.WriteAwait,
 		AvgQueueSize:     device.AvgQueueSize,
+		AvgReqSize:       device.AvgReqSize,
 		// Utilization:      device.Utilization,
 	}
 }

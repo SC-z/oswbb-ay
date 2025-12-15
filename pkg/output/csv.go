@@ -45,6 +45,7 @@ func (f *CSVFormatter) OutputIOStatData(data []IOStatRawMetrics, filename string
 		"read_await",
 		"write_await",
 		"avg_queue_size",
+		"avg_req_size",
 		// "utilization",
 	}
 
@@ -74,6 +75,10 @@ func (f *CSVFormatter) OutputIOStatData(data []IOStatRawMetrics, filename string
 	for _, device := range devices {
 		metricsList := deviceMap[device]
 		for _, metrics := range metricsList {
+			avgReqSizeStr := "NA"
+			if metrics.AvgReqSize != nil {
+				avgReqSizeStr = strconv.FormatFloat(*metrics.AvgReqSize, 'f', 2, 64)
+			}
 			record := []string{
 				metrics.Timestamp,
 				metrics.Device,
@@ -92,6 +97,7 @@ func (f *CSVFormatter) OutputIOStatData(data []IOStatRawMetrics, filename string
 				strconv.FormatFloat(metrics.ReadAwait, 'f', 2, 64),
 				strconv.FormatFloat(metrics.WriteAwait, 'f', 2, 64),
 				strconv.FormatFloat(metrics.AvgQueueSize, 'f', 2, 64),
+				avgReqSizeStr,
 				// strconv.FormatFloat(metrics.Utilization, 'f', 2, 64),
 			}
 
