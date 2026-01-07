@@ -3,6 +3,7 @@ package output
 import (
 	"oswbb-analyse/pkg/iostat"
 	"oswbb-analyse/pkg/meminfo"
+	"oswbb-analyse/pkg/top"
 	"time"
 )
 
@@ -58,10 +59,35 @@ type MemInfoRawMetrics struct {
 	SwapFree  int64 `json:"swap_free" csv:"swap_free"`
 }
 
+// TopRawMetrics top原始指标
+type TopRawMetrics struct {
+	Timestamp string `json:"timestamp" csv:"timestamp"`
+
+	// Load Average
+	Load1  float64 `json:"load_1" csv:"load_1"`
+	Load5  float64 `json:"load_5" csv:"load_5"`
+	Load15 float64 `json:"load_15" csv:"load_15"`
+
+	// Tasks
+	TaskTotal    int `json:"task_total" csv:"task_total"`
+	TaskRunning  int `json:"task_running" csv:"task_running"`
+	TaskSleeping int `json:"task_sleeping" csv:"task_sleeping"`
+	TaskStopped  int `json:"task_stopped" csv:"task_stopped"`
+	TaskZombie   int `json:"task_zombie" csv:"task_zombie"`
+
+	// CPU
+	CpuUser  float64 `json:"cpu_user" csv:"cpu_user"`
+	CpuSys   float64 `json:"cpu_sys" csv:"cpu_sys"`
+	CpuIdle  float64 `json:"cpu_idle" csv:"cpu_idle"`
+	CpuWait  float64 `json:"cpu_wait" csv:"cpu_wait"`
+	CpuSteal float64 `json:"cpu_steal" csv:"cpu_steal"`
+}
+
 // OutputFormatter 输出格式接口
 type OutputFormatter interface {
 	OutputIOStatData(data []IOStatRawMetrics, filename string) error
 	OutputMemInfoData(data []MemInfoRawMetrics, filename string) error
+	OutputTopData(data []TopRawMetrics, filename string) error
 }
 
 // isInTimeRange 检查时间是否在指定范围内
@@ -147,4 +173,35 @@ func createMemInfoMetrics(timestamp string, memStats *meminfo.MemStats) MemInfoR
 		SwapTotal:    memStats.SwapTotal,
 		SwapFree:     memStats.SwapFree,
 	}
+}
+
+// ConvertTopData 将top数据转换为原始指标格式
+func ConvertTopData(topLog *top.TopLog, startTime, endTime time.Time) []TopRawMetrics {
+	var result []TopRawMetrics
+
+	for _, snap := range topLog.Snapshots {
+		if !isInTimeRange(snap.Timestamp, startTime, endTime) {
+			continue
+		}
+
+		metrics := TopRawMetrics{
+			Timestamp:    snap.Timestamp.Format(TimestampFormat),
+			Load1:        snap.Load1,
+			Load5:        snap.Load5,
+			Load15:       snap.Load15,
+			TaskTotal:    snap.TaskTotal,
+			TaskRunning:  snap.TaskRunning,
+			TaskSleeping: snap.TaskSleeping,
+			TaskStopped:  snap.TaskStopped,
+			TaskZombie:   snap.TaskZombie,
+			CpuUser:      snap.CpuUser,
+			CpuSys:       snap.CpuSys,
+			CpuIdle:      snap.CpuIdle,
+			CpuWait:      snap.CpuWait,
+			CpuSteal:     snap.CpuSteal,
+		}
+		result = append(result, metrics)
+	}
+
+	return result
 }

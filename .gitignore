@@ -15,8 +15,9 @@ test_log
 oswatcher_analyzer.py
 main.py
 test.py
-oswbb-analyse
 *.dat
 *.gz
+
 .DS_Store
 .python-version
+oswbb-analyse

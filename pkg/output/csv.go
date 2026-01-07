@@ -159,3 +159,64 @@ func (f *CSVFormatter) OutputMemInfoData(data []MemInfoRawMetrics, filename stri
 	fmt.Printf("已将meminfo数据写入文件: %s\n", filename)
 	return nil
 }
+
+// OutputTopData 输出top数据为CSV格式
+func (f *CSVFormatter) OutputTopData(data []TopRawMetrics, filename string) error {
+	file, err := os.Create(filename)
+	if err != nil {
+		return fmt.Errorf("创建文件失败: %v", err)
+	}
+	defer file.Close()
+
+	writer := csv.NewWriter(file)
+	defer writer.Flush()
+
+	// 写入CSV头部
+	headers := []string{
+		"timestamp",
+		"load_1",
+		"load_5",
+		"load_15",
+		"task_total",
+		"task_running",
+		"task_sleeping",
+		"task_stopped",
+		"task_zombie",
+		"cpu_user",
+		"cpu_sys",
+		"cpu_idle",
+		"cpu_wait",
+		"cpu_steal",
+	}
+
+	if err := writer.Write(headers); err != nil {
+		return fmt.Errorf("写入CSV头部失败: %v", err)
+	}
+
+	// 写入数据行
+	for _, metrics := range data {
+		record := []string{
+			metrics.Timestamp,
+			strconv.FormatFloat(metrics.Load1, 'f', 2, 64),
+			strconv.FormatFloat(metrics.Load5, 'f', 2, 64),
+			strconv.FormatFloat(metrics.Load15, 'f', 2, 64),
+			strconv.Itoa(metrics.TaskTotal),
+			strconv.Itoa(metrics.TaskRunning),
+			strconv.Itoa(metrics.TaskSleeping),
+			strconv.Itoa(metrics.TaskStopped),
+			strconv.Itoa(metrics.TaskZombie),
+			strconv.FormatFloat(metrics.CpuUser, 'f', 1, 64),
+			strconv.FormatFloat(metrics.CpuSys, 'f', 1, 64),
+			strconv.FormatFloat(metrics.CpuIdle, 'f', 1, 64),
+			strconv.FormatFloat(metrics.CpuWait, 'f', 1, 64),
+			strconv.FormatFloat(metrics.CpuSteal, 'f', 1, 64),
+		}
+
+		if err := writer.Write(record); err != nil {
+			return fmt.Errorf("写入CSV数据行失败: %v", err)
+		}
+	}
+
+	fmt.Printf("已将top数据写入文件: %s\n", filename)
+	return nil
+}

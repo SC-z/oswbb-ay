@@ -54,6 +54,22 @@ func (f *HTMLFormatter) OutputMemInfoData(data []MemInfoRawMetrics, filename str
 	return f.writeHTML(filename, tmplData)
 }
 
+// OutputTopData 输出top数据为HTML格式
+func (f *HTMLFormatter) OutputTopData(data []TopRawMetrics, filename string) error {
+	jsonData, err := json.Marshal(data)
+	if err != nil {
+		return fmt.Errorf("JSON序列化失败: %v", err)
+	}
+
+	tmplData := htmlData{
+		Title:    "OSWbb Top 分析报告",
+		DataType: "top",
+		Data:     string(jsonData),
+	}
+
+	return f.writeHTML(filename, tmplData)
+}
+
 func (f *HTMLFormatter) writeHTML(filename string, data htmlData) error {
 	file, err := os.Create(filename)
 	if err != nil {
@@ -131,6 +147,8 @@ const htmlTemplate = `<!DOCTYPE html>
                 renderIOStat(container);
             } else if (dataType === 'meminfo') {
                 renderMemInfo(container);
+            } else if (dataType === 'top') {
+                renderTop(container);
             }
             
             // 窗口大小改变时重绘
@@ -376,6 +394,65 @@ const htmlTemplate = `<!DOCTYPE html>
             });
             
             echarts.connect('meminfo_group');
+        }
+
+        // ================= Top 逻辑 =================
+        function renderTop(container) {
+            const timestamps = rawData.map(d => d.timestamp);
+
+            // 1. Load Average
+            createTopChart(container, 'Load Average', timestamps, [
+                { name: 'Load 1min', data: rawData.map(d => d.load_1) },
+                { name: 'Load 5min', data: rawData.map(d => d.load_5) },
+                { name: 'Load 15min', data: rawData.map(d => d.load_15) }
+            ]);
+
+            // 2. CPU Usage
+            createTopChart(container, 'CPU 使用率 (%)', timestamps, [
+                { name: 'User', data: rawData.map(d => d.cpu_user) },
+                { name: 'Sys', data: rawData.map(d => d.cpu_sys) },
+                { name: 'Wait', data: rawData.map(d => d.cpu_wait) },
+                { name: 'Idle', data: rawData.map(d => d.cpu_idle) }
+            ]);
+
+            // 3. Tasks
+            createTopChart(container, '进程状态 (Tasks)', timestamps, [
+                { name: 'Running', data: rawData.map(d => d.task_running) },
+                { name: 'Sleeping', data: rawData.map(d => d.task_sleeping) },
+                { name: 'Zombie', data: rawData.map(d => d.task_zombie) }
+            ]);
+            
+            echarts.connect('top_group');
+        }
+
+        function createTopChart(container, title, timestamps, seriesData) {
+            const div = document.createElement('div');
+            div.className = 'chart-container';
+            container.appendChild(div);
+            
+            const chart = echarts.init(div);
+            chart.group = 'top_group';
+            charts.push(chart);
+            
+            const series = seriesData.map(s => ({
+                name: s.name,
+                type: 'line',
+                showSymbol: false,
+                data: s.data,
+                smooth: true
+            }));
+
+            const option = {
+                title: { text: title, left: 'center' },
+                tooltip: { trigger: 'axis' },
+                legend: { bottom: 0 },
+                grid: { left: '3%', right: '4%', bottom: '10%', containLabel: true },
+                xAxis: { type: 'category', data: timestamps, boundaryGap: false },
+                yAxis: { type: 'value' },
+                dataZoom: [{ type: 'slider', show: true, bottom: 35 }], // 统一使用 slider
+                series: series
+            };
+            chart.setOption(option);
         }
     </script>
 </body>

@@ -50,312 +50,183 @@ func (fp *FileProcessor) ProcessSingleFile(filename, startTimeStr, endTimeStr, o
 	fileName := strings.ToLower(filename)
 	isIOStat := strings.Contains(fileName, "iostat")
 	isMemInfo := strings.Contains(fileName, "meminfo")
+	isTop := strings.Contains(fileName, "top")
 
-	if !isIOStat && !isMemInfo {
-		return fmt.Errorf("无法识别文件类型，文件名应包含 'iostat' 或 'meminfo'")
+	if !isIOStat && !isMemInfo && !isTop {
+		return fmt.Errorf("无法识别文件类型，文件名应包含 'iostat', 'meminfo' 或 'top'")
 	}
 
 	if isIOStat {
 		return AnalyzeIOStatFile(filename, startTimeStr, endTimeStr, outputFormat, cst)
 	} else if isMemInfo {
 		return AnalyzeMemInfoFile(filename, startTimeStr, endTimeStr, outputFormat, cst)
+	} else if isTop {
+		return AnalyzeTopFile(filename, startTimeStr, endTimeStr, outputFormat, cst)
 	}
 
 	return nil
 }
 
 // ProcessDirectory 处理目录中的所有相关文件
-
 func (fp *FileProcessor) ProcessDirectory(dirPath, startTimeStr, endTimeStr string, singleMode bool, outputFormat string, cst *time.Location) error {
-
 	fmt.Printf("扫描目录: %s\n", dirPath)
 
-
-
-	iostatFiles, meminfoFiles, gzFiles, err := scanDirectory(dirPath)
-
+	iostatFiles, meminfoFiles, topFiles, gzFiles, err := scanDirectory(dirPath)
 	if err != nil {
-
 		return fmt.Errorf("扫描目录失败: %v", err)
-
 	}
-
-
 
 	// 报告发现的文件
-
 	fmt.Printf("发现 %d 个iostat文件\n", len(iostatFiles))
-
 	fmt.Printf("发现 %d 个meminfo文件\n", len(meminfoFiles))
-
-
+	fmt.Printf("发现 %d 个top文件\n", len(topFiles))
 
 	if len(gzFiles) > 0 {
-
 		if err := decompressGzFiles(gzFiles); err != nil {
-
 			fmt.Printf("解压过程出现警告: %v\n", err)
-
 		}
-
-
 
 		fmt.Println("解压完成，重新扫描目录...")
-
-		iostatFiles, meminfoFiles, _, err = scanDirectory(dirPath)
-
+	iostatFiles, meminfoFiles, topFiles, _, err = scanDirectory(dirPath)
 		if err != nil {
-
 			return fmt.Errorf("重新扫描目录失败: %v", err)
-
 		}
-
 	}
 
-
-
-	if len(iostatFiles) == 0 && len(meminfoFiles) == 0 {
-
-		fmt.Println("目录中未找到包含 'iostat' 或 'meminfo' 的文件")
-
+	if len(iostatFiles) == 0 && len(meminfoFiles) == 0 && len(topFiles) == 0 {
+		fmt.Println("目录中未找到包含 'iostat', 'meminfo' 或 'top' 的文件")
 		return nil
-
 	}
-
-
 
 	if singleMode {
-
-		return processSingleFiles(iostatFiles, meminfoFiles, startTimeStr, endTimeStr, outputFormat, cst)
-
+		return processSingleFiles(iostatFiles, meminfoFiles, topFiles, startTimeStr, endTimeStr, outputFormat, cst)
 	}
 
-
-
-	return processMergedFiles(iostatFiles, meminfoFiles, startTimeStr, endTimeStr, outputFormat, cst)
-
+	return processMergedFiles(iostatFiles, meminfoFiles, topFiles, startTimeStr, endTimeStr, outputFormat, cst)
 }
 
-
-
 // scanDirectory 扫描目录并分类文件
-
-func scanDirectory(dirPath string) (iostatFiles, meminfoFiles, gzFiles []string, err error) {
-
+func scanDirectory(dirPath string) (iostatFiles, meminfoFiles, topFiles, gzFiles []string, err error) {
 	err = filepath.Walk(dirPath, func(path string, info os.FileInfo, err error) error {
-
 		if err != nil {
-
 			return err
-
 		}
-
-
 
 		if info.IsDir() {
-
 			return nil
-
 		}
 
-
+		if strings.HasPrefix(info.Name(), ".") {
+			return nil
+		}
 
 		fileName := strings.ToLower(info.Name())
 
-
-
 		if strings.HasSuffix(fileName, ".gz") {
-
 			gzFiles = append(gzFiles, path)
-
 			return nil
-
 		}
-
-
 
 		if strings.Contains(fileName, "iostat") {
-
 			iostatFiles = append(iostatFiles, path)
-
 		} else if strings.Contains(fileName, "meminfo") {
-
 			meminfoFiles = append(meminfoFiles, path)
-
+		} else if strings.Contains(fileName, "top") {
+			topFiles = append(topFiles, path)
 		}
-
-
 
 		return nil
-
 	})
-
 	return
-
 }
-
-
 
 // decompressGzFiles 批量解压文件
-
 func decompressGzFiles(gzFiles []string) error {
-
 	fmt.Printf("\n发现 %d 个压缩文件(.gz)，正在尝试自动解压...\n", len(gzFiles))
-
 	for _, gzFile := range gzFiles {
-
 		fmt.Printf("解压: %s\n", gzFile)
-
 		cmd := exec.Command("gzip", "-d", gzFile)
-
 		if err := cmd.Run(); err != nil {
-
 			fmt.Printf("解压失败 %s: %v\n", gzFile, err)
-
 		}
-
 	}
-
 	return nil
-
 }
-
-
 
 // processSingleFiles 单文件模式处理
-
-func processSingleFiles(iostatFiles, meminfoFiles []string, startTimeStr, endTimeStr, outputFormat string, cst *time.Location) error {
-
+func processSingleFiles(iostatFiles, meminfoFiles, topFiles []string, startTimeStr, endTimeStr, outputFormat string, cst *time.Location) error {
 	fmt.Println("\n单文件模式: 每个文件独立分析")
 
-
-
 	processFiles := func(files []string, fileType string, analyzeFunc func(string, string, string, string, *time.Location) error) {
-
 		for i, file := range files {
-
 			fmt.Printf("\n" + strings.Repeat("=", 80) + "\n")
-
 			fmt.Printf("正在分析%s文件 [%d/%d]: %s\n", fileType, i+1, len(files), file)
-
 			fmt.Printf(strings.Repeat("=", 80) + "\n")
-
 			if err := analyzeFunc(file, startTimeStr, endTimeStr, outputFormat, cst); err != nil {
-
 				fmt.Printf("分析失败: %v\n", err)
-
 			}
-
 		}
-
 	}
-
-
 
 	processFiles(iostatFiles, "iostat", AnalyzeIOStatFile)
-
 	processFiles(meminfoFiles, "meminfo", AnalyzeMemInfoFile)
-
+	processFiles(topFiles, "top", AnalyzeTopFile)
 	return nil
-
 }
-
-
 
 // processMergedFiles 合并模式处理
-
-func processMergedFiles(iostatFiles, meminfoFiles []string, startTimeStr, endTimeStr, outputFormat string, cst *time.Location) error {
-
+func processMergedFiles(iostatFiles, meminfoFiles, topFiles []string, startTimeStr, endTimeStr, outputFormat string, cst *time.Location) error {
 	fmt.Println("\n合并模式: 按主机名分组统一分析")
 
-
-
-	hostFiles := groupFilesByHost(iostatFiles, meminfoFiles)
-
-
+	hostFiles := groupFilesByHost(iostatFiles, meminfoFiles, topFiles)
 
 	for hostname, fileTypes := range hostFiles {
-
 		fmt.Printf("\n" + strings.Repeat("=", 80) + "\n")
-
 		fmt.Printf("主机: %s\n", hostname)
-
 		fmt.Printf(strings.Repeat("=", 80) + "\n")
 
-
-
 		if files, exists := fileTypes["iostat"]; exists && len(files) > 0 {
-
 			fmt.Printf("\n--- 分析 %s 主机的 %d 个iostat文件 ---\n", hostname, len(files))
-
 			if err := AnalyzeMergedIOStatFiles(files, startTimeStr, endTimeStr, outputFormat, cst); err != nil {
-
 				fmt.Printf("iostat分析失败: %v\n", err)
-
 			}
-
 		}
-
-
 
 		if files, exists := fileTypes["meminfo"]; exists && len(files) > 0 {
-
 			fmt.Printf("\n--- 分析 %s 主机的 %d 个meminfo文件 ---\n", hostname, len(files))
-
 			if err := AnalyzeMergedMemInfoFiles(files, startTimeStr, endTimeStr, outputFormat, cst); err != nil {
-
 				fmt.Printf("meminfo分析失败: %v\n", err)
-
 			}
-
 		}
 
+		if files, exists := fileTypes["top"]; exists && len(files) > 0 {
+			fmt.Printf("\n--- 分析 %s 主机的 %d 个top文件 ---\n", hostname, len(files))
+			if err := AnalyzeMergedTopFiles(files, startTimeStr, endTimeStr, outputFormat, cst); err != nil {
+				fmt.Printf("top分析失败: %v\n", err)
+			}
+		}
 	}
-
 	return nil
-
 }
-
-
 
 // groupFilesByHost 按主机名分组文件
-
-func groupFilesByHost(iostatFiles, meminfoFiles []string) map[string]map[string][]string {
-
+func groupFilesByHost(iostatFiles, meminfoFiles, topFiles []string) map[string]map[string][]string {
 	hostFiles := make(map[string]map[string][]string)
 
-
-
 	addFile := func(files []string, fileType string) {
-
 		for _, file := range files {
-
 			hostname := extractHostname(file)
-
 			if hostname != "" {
-
 				if hostFiles[hostname] == nil {
-
 					hostFiles[hostname] = make(map[string][]string)
-
 				}
-
-				hostFiles[hostname][fileType] = append(hostFiles[hostname][fileType], file)
-
+			hostFiles[hostname][fileType] = append(hostFiles[hostname][fileType], file)
 			}
-
 		}
-
 	}
 
-
-
 	addFile(iostatFiles, "iostat")
-
 	addFile(meminfoFiles, "meminfo")
-
+	addFile(topFiles, "top")
 	return hostFiles
-
 }
-
-
