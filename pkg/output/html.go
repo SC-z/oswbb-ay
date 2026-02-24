@@ -331,6 +331,9 @@ const htmlTemplate = `<!DOCTYPE html>
                 { key: 'mem_free', name: '空闲内存 (KB)' },
                 { key: 'cached', name: '缓存 (KB)' },
                 { key: 'buffers', name: '缓冲区 (KB)' },
+                { key: 's_reclaimable', name: 'SReclaimable 可回收 Slab (KB)' },
+                { key: 's_unreclaim', name: 'SUnreclaim 不可回收 Slab (KB)' },
+                { key: 'anon_pages', name: 'AnonPages 匿名页 (KB)' },
                 { key: 'swap_total', name: 'Swap 总量 (KB)' },
                 { key: 'swap_free', name: 'Swap 空闲 (KB)' }
             ];

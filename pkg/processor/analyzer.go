@@ -24,33 +24,33 @@ const (
 	memLongWindow  = 720 // 长窗口采样点数
 
 	// meminfo 阈值配置
-	memAvailWarnPct         = 20.0
-	memAvailSeverePct       = 10.0 // 更新为 10%
-	memAvailSevereMB        = 8192.0  // 8GB
-	memAvailWarnMB          = 16384.0 // 16GB
+	memAvailWarnPct   = 20.0
+	memAvailSeverePct = 10.0    // 更新为 10%
+	memAvailSevereMB  = 8192.0  // 8GB
+	memAvailWarnMB    = 16384.0 // 16GB
 
-	memSwapSeverePct        = 10.0
-	memUnreclaimPctThresh   = 2.0
+	memSwapSeverePct      = 10.0
+	memUnreclaimPctThresh = 2.0
 
 	// Slab 告警配置
-	memSlabWarnMB           = 20480.0 // 20GB
-	memSlabWarnPct          = 8.0
+	memSlabWarnMB  = 20480.0 // 20GB
+	memSlabWarnPct = 8.0
 
-	memAnonLeakDeltaMB      = 200.0
+	memAnonLeakDeltaMB         = 200.0
 	memAnonLeakRateMBPerSample = 50.0
-	
-	memSwapBurstPct         = 20.0
+
+	memSwapBurstPct          = 20.0
 	memSlopeBurstMBPerSample = 500.0
-	memKernelAbsWarnMB      = 500.0
-	memKernelDeltaPctWarn   = 50.0
+	memKernelAbsWarnMB       = 500.0
+	memKernelDeltaPctWarn    = 50.0
 
 	// V型波动检测配置
-	memVPatternDropMB       = 4096.0 // 4GB
-	memVPatternRecoverMB    = 2048.0 // 2GB
+	memVPatternDropMB    = 4096.0 // 4GB
+	memVPatternRecoverMB = 2048.0 // 2GB
 
 	// 突变检测配置
-	memSuddenChangePct      = 2.0    // 2%
-	memSuddenChangeMinMB    = 2048.0 // 2GB
+	memSuddenChangePct   = 2.0    // 2%
+	memSuddenChangeMinMB = 2048.0 // 2GB
 )
 
 // timeRangedLog 定义能够提供时间范围的日志接口
@@ -156,6 +156,33 @@ func executeAnalysisTemplate(
 	return exportAction(startTime, endTime, formatter)
 }
 
+// outputFileExt 根据输出格式返回文件后缀
+func outputFileExt(outputFormat string) string {
+	switch outputFormat {
+	case "html":
+		return "html"
+	case "json":
+		return "json"
+	default:
+		// csv 与 ml 都落为 csv 文件
+		return "csv"
+	}
+}
+
+// sortIOStatDataByTimestamp 按时间升序排序 iostat 合并数据
+func sortIOStatDataByTimestamp(data []iostat.IOStatData) {
+	sort.Slice(data, func(i, j int) bool {
+		return data[i].Timestamp.Before(data[j].Timestamp)
+	})
+}
+
+// sortMemInfoDataByTimestamp 按时间升序排序 meminfo 合并数据
+func sortMemInfoDataByTimestamp(data []meminfo.MemStatData) {
+	sort.Slice(data, func(i, j int) bool {
+		return data[i].Timestamp.Before(data[j].Timestamp)
+	})
+}
+
 // analyzeIOStatLog 根据配置分析 iostat 日志
 func analyzeIOStatLog(log *iostat.IOStatLog, opts analysisOptions) error {
 	return executeAnalysisTemplate(log, opts,
@@ -165,17 +192,12 @@ func analyzeIOStatLog(log *iostat.IOStatLog, opts analysisOptions) error {
 		func(start, end time.Time, formatter output.OutputFormatter) error {
 			rawMetrics := output.ConvertIOStatData(log, start, end)
 
-			ext := "csv"
-			if opts.outputFormat == "html" {
-				ext = "html"
-			}
-
+			ext := outputFileExt(opts.outputFormat)
 			filename := fmt.Sprintf("iostat_%s.%s", time.Now().Format("20060102150405"), ext)
 			return formatter.OutputIOStatData(rawMetrics, filename)
 		},
 	)
 }
-
 
 // printIOStatReport 打印 iostat 报告模式详情
 func printIOStatReport(log *iostat.IOStatLog, startTime, endTime time.Time) {
@@ -262,6 +284,7 @@ func mergeIOStatFiles(filenames []string, parser *iostat.IOStatParser) (*iostat.
 	if len(allData) == 0 {
 		return nil, parseErrs
 	}
+	sortIOStatDataByTimestamp(allData)
 
 	return &iostat.IOStatLog{
 		Header: fmt.Sprintf("合并了 %d 个文件", len(filenames)),
@@ -285,11 +308,7 @@ func analyzeMemInfoLog(log *meminfo.MemInfoLog, opts analysisOptions, timeLayout
 		func(start, end time.Time, formatter output.OutputFormatter) error {
 			rawMetrics := output.ConvertMemInfoData(log, start, end)
 
-			ext := "csv"
-			if opts.outputFormat == "html" {
-				ext = "html"
-			}
-
+			ext := outputFileExt(opts.outputFormat)
 			filename := fmt.Sprintf("meminfo_%s.%s", time.Now().Format("20060102150405"), ext)
 			return formatter.OutputMemInfoData(rawMetrics, filename)
 		},
@@ -343,25 +362,25 @@ func printMemInfoReport(log *meminfo.MemInfoLog, startTime, endTime time.Time, t
 	anonAnomalies := findSignificantTrendChange(data, func(ms meminfo.MemStats) float64 { return float64(ms.AnonPages) }, memSlopeBurstMBPerSample, memTotalMBVal)
 
 	slabAnomalies := findSignificantTrendChange(data, func(ms meminfo.MemStats) float64 { return float64(ms.Slab) }, 200, memTotalMBVal)
-	
+
 	slabMB := kbToMB(float64(latest.MemStats.Slab))
 	slabPct := pct(float64(latest.MemStats.Slab), memTotalKB)
 	slabStatus := classifySlab(slabMB, slabPct)
 	unreclaimStatus := classifyUnreclaim(unreclaimPct, slabStats.slopeShort)
-	
+
 	swapUsageStatus := classifySwapUsage(latest.MemStats.SwapFree, latest.MemStats.SwapTotal, swapPct, availPct)
 	deltaSwapPct := swapDeltaPct(shortWin, latest.MemStats.SwapTotal)
-	
+
 	// Swap 异常检测
 	var swapAnomalies []common.TrendAnomaly
 	swapBurst := "无"
 	var swapChangeTime time.Time
-	
+
 	if latest.MemStats.SwapTotal > 0 {
 		swapTotalMB := float64(latest.MemStats.SwapTotal) / 1024.0
 		swapThreshold := (swapTotalMB * (memSwapBurstPct / 100.0)) / float64(memShortWindow)
 		swapAnomalies = findSignificantTrendChange(data, func(ms meminfo.MemStats) float64 { return float64(ms.SwapFree) }, swapThreshold, memTotalMBVal)
-		
+
 		for _, anomaly := range swapAnomalies {
 			if anomaly.Type == "骤降(单点)" || anomaly.Type == "骤降(趋势)" {
 				swapBurst = "Swap 激增"
@@ -462,6 +481,7 @@ func mergeMemInfoFiles(filenames []string, parser *meminfo.MemInfoParser) (*memi
 	if len(allData) == 0 {
 		return nil, parseErrs
 	}
+	sortMemInfoDataByTimestamp(allData)
 
 	return &meminfo.MemInfoLog{
 		Data: allData,
@@ -836,7 +856,7 @@ func detectVPattern(data []meminfo.MemStatData, extractor func(meminfo.MemStats)
 			})
 		}
 	}
-	
+
 	// 按跌落幅度降序排序
 	sort.Slice(anomalies, func(i, j int) bool {
 		return anomalies[i].Value > anomalies[j].Value
@@ -863,11 +883,11 @@ func findSignificantTrendChange(data []meminfo.MemStatData, extractor func(memin
 	for i := 1; i < len(data); i++ {
 		valCurrent := extractor(data[i].MemStats)
 		valPrev := extractor(data[i-1].MemStats)
-		
+
 		// --- 检测 A: 相邻点骤变 (针对单点异常) ---
 		deltaMB := (valCurrent - valPrev) / 1024.0
 		absDelta := math.Abs(deltaMB)
-		
+
 		if absDelta > suddenChangeThresholdMB {
 			anomaly := common.TrendAnomaly{
 				Time:      data[i].Timestamp,
@@ -895,7 +915,9 @@ func findSignificantTrendChange(data []meminfo.MemStatData, extractor func(memin
 		// --- 检测 B: 趋势斜率变化 (针对缓慢泄漏) ---
 		longStartIdx := i - memLongWindow
 		shortStartIdx := i - memShortWindow
-		if shortStartIdx < 0 { shortStartIdx = 0 }
+		if shortStartIdx < 0 {
+			shortStartIdx = 0
+		}
 
 		valLongStart := extractor(data[longStartIdx].MemStats)
 		valShortStart := extractor(data[shortStartIdx].MemStats)
@@ -933,7 +955,6 @@ func findSignificantTrendChange(data []meminfo.MemStatData, extractor func(memin
 
 	return anomalies
 }
-
 
 // deltaMB 计算窗口首尾差值 (MB)
 func deltaMB(win []meminfo.MemStatData, extractor func(meminfo.MemStats) float64) float64 {
@@ -1145,10 +1166,10 @@ func formatAnomalies(anomalies []common.TrendAnomaly, layout string) string {
 // printAnomalyDetailList 打印详细异常列表
 func printAnomalyDetailList(categories map[string][]common.TrendAnomaly, layout string) {
 	fmt.Println("[异常点列表]")
-	
+
 	// 按固定顺���输出
 	keys := []string{"可用内存 (Available)", "匿名页 (AnonPages)", "Slab", "Swap"}
-	
+
 	index := 1
 	for _, key := range keys {
 		anomalies, exists := categories[key]
@@ -1159,7 +1180,7 @@ func printAnomalyDetailList(categories map[string][]common.TrendAnomaly, layout 
 		}
 
 		fmt.Printf("\n%d. %s\n", index, key)
-		
+
 		// 限制显示数量，防止刷屏 (例如前 10 个)
 		limit := 10
 		if len(anomalies) > limit {
@@ -1170,7 +1191,7 @@ func printAnomalyDetailList(categories map[string][]common.TrendAnomaly, layout 
 		for _, a := range anomalies {
 			fmt.Printf("   - 时间: %s\n", a.Time.Format(layout))
 			fmt.Printf("     类型: %s\n", a.Type)
-			
+
 			// 根据类型格式化详情
 			if a.Type == "V型波动" {
 				fmt.Printf("     详情: 跌落 %.2f GB (%.2f -> %.2f GB)\n", a.Value, kbToGB(a.StartVal*1024), kbToGB(a.EndVal*1024))
@@ -1179,9 +1200,9 @@ func printAnomalyDetailList(categories map[string][]common.TrendAnomaly, layout 
 			} else {
 				fmt.Printf("     详情: %.2f -> %.2f GB (变化量: %.2f GB)\n", kbToGB(a.StartVal*1024), kbToGB(a.EndVal*1024), a.Value/1024.0) // a.Value 是 MB
 			}
-			
+
 			fmt.Printf("     规则: 命中\"%s\"\n", a.RuleName)
-			
+
 			// 格式化阈值显示
 			threshStr := ""
 			if a.RuleName == "趋势斜率差异" {

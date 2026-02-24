@@ -17,13 +17,7 @@ func analyzeTopLog(log *top.TopLog, opts analysisOptions) error {
 		func(start, end time.Time, formatter output.OutputFormatter) error {
 			rawMetrics := output.ConvertTopData(log, start, end)
 
-			ext := "csv"
-			if opts.outputFormat == "html" {
-				ext = "html"
-			} else if opts.outputFormat == "json" {
-				ext = "json"
-			}
-
+			ext := outputFileExt(opts.outputFormat)
 			filename := fmt.Sprintf("top_%s.%s", time.Now().Format("20060102150405"), ext)
 			return formatter.OutputTopData(rawMetrics, filename)
 		},
@@ -181,7 +175,7 @@ func AnalyzeTopFile(filename, startTimeStr, endTimeStr, outputFormat string, cst
 // AnalyzeMergedTopFiles 合并分析多个top文件
 func AnalyzeMergedTopFiles(filenames []string, startTimeStr, endTimeStr, outputFormat string, cst *time.Location) error {
 	parser := top.NewTopParser()
-	
+
 	var allSnapshots []top.TopSnapshot
 	var parseErrs []error
 

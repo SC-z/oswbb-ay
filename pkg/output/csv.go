@@ -106,7 +106,7 @@ func (f *CSVFormatter) OutputIOStatData(data []IOStatRawMetrics, filename string
 			}
 		}
 	}
-	
+
 	fmt.Printf("已将iostat数据写入文件: %s\n", filename)
 	return nil
 }
@@ -130,6 +130,9 @@ func (f *CSVFormatter) OutputMemInfoData(data []MemInfoRawMetrics, filename stri
 		"mem_available",
 		"buffers",
 		"cached",
+		"s_reclaimable",
+		"s_unreclaim",
+		"anon_pages",
 		"swap_total",
 		"swap_free",
 	}
@@ -147,6 +150,9 @@ func (f *CSVFormatter) OutputMemInfoData(data []MemInfoRawMetrics, filename stri
 			strconv.FormatInt(metrics.MemAvailable, 10),
 			strconv.FormatInt(metrics.Buffers, 10),
 			strconv.FormatInt(metrics.Cached, 10),
+			strconv.FormatInt(metrics.SReclaimable, 10),
+			strconv.FormatInt(metrics.SUnreclaim, 10),
+			strconv.FormatInt(metrics.AnonPages, 10),
 			strconv.FormatInt(metrics.SwapTotal, 10),
 			strconv.FormatInt(metrics.SwapFree, 10),
 		}
@@ -155,7 +161,7 @@ func (f *CSVFormatter) OutputMemInfoData(data []MemInfoRawMetrics, filename stri
 			return fmt.Errorf("写入CSV数据行失败: %v", err)
 		}
 	}
-	
+
 	fmt.Printf("已将meminfo数据写入文件: %s\n", filename)
 	return nil
 }

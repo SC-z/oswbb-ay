@@ -35,9 +35,9 @@ type IOStatRawMetrics struct {
 	WriteMergePerSec float64 `json:"write_merge_per_sec" csv:"write_merge_per_sec"`
 
 	// I/O 延迟和队列指标
-	ReadAwait    float64 `json:"read_await" csv:"read_await"`
-	WriteAwait   float64 `json:"write_await" csv:"write_await"`
-	AvgQueueSize float64 `json:"avg_queue_size" csv:"avg_queue_size"`
+	ReadAwait    float64  `json:"read_await" csv:"read_await"`
+	WriteAwait   float64  `json:"write_await" csv:"write_await"`
+	AvgQueueSize float64  `json:"avg_queue_size" csv:"avg_queue_size"`
 	AvgReqSize   *float64 `json:"avg_req_size" csv:"avg_req_size"`
 	// Utilization      float64 `json:"utilization" csv:"utilization"`
 }
@@ -53,6 +53,9 @@ type MemInfoRawMetrics struct {
 	MemAvailable int64 `json:"mem_available" csv:"mem_available"`
 	Buffers      int64 `json:"buffers" csv:"buffers"`
 	Cached       int64 `json:"cached" csv:"cached"`
+	SReclaimable int64 `json:"s_reclaimable" csv:"s_reclaimable"`
+	SUnreclaim   int64 `json:"s_unreclaim" csv:"s_unreclaim"`
+	AnonPages    int64 `json:"anon_pages" csv:"anon_pages"`
 
 	// 交换分区指标 (单位:KB)
 	SwapTotal int64 `json:"swap_total" csv:"swap_total"`
@@ -170,6 +173,9 @@ func createMemInfoMetrics(timestamp string, memStats *meminfo.MemStats) MemInfoR
 		MemAvailable: memStats.MemAvailable,
 		Buffers:      memStats.Buffers,
 		Cached:       memStats.Cached,
+		SReclaimable: memStats.SReclaimable,
+		SUnreclaim:   memStats.SUnreclaim,
+		AnonPages:    memStats.AnonPages,
 		SwapTotal:    memStats.SwapTotal,
 		SwapFree:     memStats.SwapFree,
 	}
