@@ -1,13 +1,14 @@
-# OSWbb 延迟采集扩展
+# OSWbb 小包/大包 ping 原始结果采集扩展
 
 该扩展保持 OSWbb 原有采集架构，为 Linux 节点增加 `oswlatency` 小时归档：
 
-- 小包：ICMP 负载 56 字节；
-- 大包：ICMP 负载 8192 字节；
+- 小包使用 ICMP 负载 56 字节；
+- 大包使用 ICMP 负载 8192 字节；
 - 每个 OSWbb 快照周期，对配置中的每个对端各探测一次；
+- 只保存 `ping` 原始输出，不解析 RTT、不判断状态、不统计丢包；
 - 复用 OSWatcher 主循环、锁、小时压缩和 `OSWatcherFM.sh` 保留清理。
 
-MTU 1500 环境下，8192 字节探测会发生 IPv4 分片，监控的是分片大报文的往返延迟，不是单个巨型帧。因此命令不使用 `-M do`。
+MTU 1500 环境下，8192 字节探测会发生 IPv4 分片，观察的是分片大报文的实际 `ping` 结果，不是单个巨型帧。因此命令不使用 `-M do`。
 
 ## 安装
 
@@ -28,6 +29,22 @@ node3 10.0.0.13
 
 格式为 `节点名 IPv4地址`。空行和以 `#` 开头的行会被忽略。
 
+## 输出
+
+每次探测先输出目标和包长标记，随后原样追加 `ping` 的标准输出和标准错误：
+
+```text
+zzz ***OSWLATENCY target=node2 address=10.0.0.12 size=56
+PING 10.0.0.12 (10.0.0.12) 56(84) bytes of data.
+64 bytes from 10.0.0.12: icmp_seq=1 ttl=64 time=0.183 ms
+...
+zzz ***OSWLATENCY target=node2 address=10.0.0.12 size=8192
+PING 10.0.0.12 (10.0.0.12) 8192(8220) bytes of data.
+...
+```
+
+扩展不会输出 `status=` 或 `rtt_ms=`，也不会根据 `ping` 返回值生成检测结论。即使一次 `ping` 超时或报错，脚本仍继续执行其他目标和包长。
+
 ## 启动与验证
 
 按照原方式重启 OSWbb，然后检查：
@@ -35,17 +52,11 @@ node3 10.0.0.13
 ```sh
 sh -n OSWatcher.sh OSWatcherFM.sh latencysub.sh
 ls -l archive/oswlatency
-grep 'OSWLATENCY|' archive/oswlatency/*_latency_*.dat
+grep 'OSWLATENCY target=' archive/oswlatency/*_latency_*.dat
+tail -n 80 archive/oswlatency/*_latency_*.dat
 ```
 
-每个对端应同时出现 `size=56` 和 `size=8192`。状态值：
-
-- `ok`：收到响应并解析出 RTT；
-- `timeout`：`ping` 返回 1，没有收到响应；
-- `ping_error`：`ping` 命令或目标错误；
-- `config_error`：配置文件缺失、为空或配置行无效。
-
-原始 `ping` 输出与结构化记录保存在同一小时文件中。上一小时文件继续按 OSWbb 原配置压缩，`OSWatcherFM.sh` 按 `archiveInterval` 清理历史文件。
+每个对端应同时出现 `size=56` 和 `size=8192`，对应标记下面应为该次 `ping` 的原始结果。上一小时文件继续按 OSWbb 原配置压缩，`OSWatcherFM.sh` 按 `archiveInterval` 清理历史文件。
 
 ## 三节点配置
 

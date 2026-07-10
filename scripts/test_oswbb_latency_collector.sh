@@ -17,10 +17,14 @@ case " $* " in
 esac
 case " $* " in
   *" -s 56 "*)
+    echo 'PING 10.0.0.12 (10.0.0.12) 56(84) bytes of data.'
     echo '64 bytes from 10.0.0.12: icmp_seq=1 ttl=64 time=0.183 ms'
+    echo '1 packets transmitted, 1 received, 0% packet loss'
     exit 0
     ;;
   *" -s 8192 "*)
+    echo 'PING 10.0.0.12 (10.0.0.12) 8192(8220) bytes of data.'
+    echo '1 packets transmitted, 0 received, 100% packet loss'
     exit 1
     ;;
 esac
@@ -35,21 +39,23 @@ PING_CALLS="$tmp/calls" \
 PATH="$tmp/bin:$PATH" \
 OSWBB_LATENCY_CONF="$tmp/oswlatency.conf" \
 OSWBB_LATENCY_LOCK="$tmp/locks/latencylock.file" \
-OSWBB_LATENCY_SOURCE=node1 \
 sh "$root/release/oswbb-latency/latencysub.sh" "$tmp/output"
 
 test "$(grep -c -- '-s 56' "$tmp/calls")" -eq 2
 test "$(grep -c -- '-s 8192' "$tmp/calls")" -eq 2
-test "$(grep -c 'size=56|status=ok|rtt_ms=0.183$' "$tmp/output")" -eq 2
-test "$(grep -c 'size=8192|status=timeout|rtt_ms=$' "$tmp/output")" -eq 2
+test "$(grep -c 'OSWLATENCY target=.* size=56$' "$tmp/output")" -eq 2
+test "$(grep -c 'OSWLATENCY target=.* size=8192$' "$tmp/output")" -eq 2
+grep -q '64 bytes from 10.0.0.12: icmp_seq=1 ttl=64 time=0.183 ms' "$tmp/output"
+grep -q '1 packets transmitted, 0 received, 100% packet loss' "$tmp/output"
+! grep -q 'status=' "$tmp/output"
+! grep -q 'rtt_ms=' "$tmp/output"
 test ! -e "$tmp/locks/latencylock.file"
 
 touch "$tmp/locks/latencylock.file"
 OSWBB_LATENCY_CONF="$tmp/missing.conf" \
 OSWBB_LATENCY_LOCK="$tmp/locks/latencylock.file" \
-OSWBB_LATENCY_SOURCE=node1 \
 sh "$root/release/oswbb-latency/latencysub.sh" "$tmp/missing-output"
-grep -q 'size=0|status=config_error|rtt_ms=$' "$tmp/missing-output"
+grep -q 'OSWLATENCY config error: cannot read ' "$tmp/missing-output"
 test ! -e "$tmp/locks/latencylock.file"
 
 printf 'bad-entry\n# comment\n' > "$tmp/malformed.conf"
@@ -58,9 +64,8 @@ PING_CALLS="$tmp/malformed-calls" \
 PATH="$tmp/bin:$PATH" \
 OSWBB_LATENCY_CONF="$tmp/malformed.conf" \
 OSWBB_LATENCY_LOCK="$tmp/locks/latencylock.file" \
-OSWBB_LATENCY_SOURCE=node1 \
 sh "$root/release/oswbb-latency/latencysub.sh" "$tmp/malformed-output"
-grep -q 'target=bad-entry|address=|size=0|status=config_error|rtt_ms=$' "$tmp/malformed-output"
+grep -q 'OSWLATENCY config error: invalid target line: bad-entry' "$tmp/malformed-output"
 test ! -s "$tmp/malformed-calls"
 test ! -e "$tmp/locks/latencylock.file"
 
@@ -70,9 +75,10 @@ PING_CALLS="$tmp/ping-error-calls" \
 PATH="$tmp/bin:$PATH" \
 OSWBB_LATENCY_CONF="$tmp/ping-error.conf" \
 OSWBB_LATENCY_LOCK="$tmp/locks/latencylock.file" \
-OSWBB_LATENCY_SOURCE=node1 \
 sh "$root/release/oswbb-latency/latencysub.sh" "$tmp/ping-error-output"
-test "$(grep -c 'status=ping_error|rtt_ms=$' "$tmp/ping-error-output")" -eq 2
+test "$(grep -c 'OSWLATENCY target=node9 address=10.0.0.99 size=' "$tmp/ping-error-output")" -eq 2
+test "$(grep -c 'ping: invalid target' "$tmp/ping-error-output")" -eq 2
+! grep -q 'status=' "$tmp/ping-error-output"
 test ! -e "$tmp/locks/latencylock.file"
 
 patch_file="$root/release/oswbb-latency/OSWatcher-latency.patch"
