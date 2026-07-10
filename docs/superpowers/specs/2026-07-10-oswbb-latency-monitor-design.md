@@ -1,98 +1,98 @@
-# OSWbb 3-Node Latency Monitor Design
+# OSWbb 三节点延迟监控设计
 
-## Goal
+## 目标
 
-Add long-running ICMP latency collection for a three-node Linux cluster while preserving the existing OSWbb collection architecture. Every node measures both remote nodes with a 56-byte payload and an 8192-byte payload on every OSWbb snapshot interval. `oswbb-analyse` reads the archived results and reports long-term latency and loss statistics.
+在保持 OSWbb 原有采集架构不变的前提下，为三节点 Linux 集群增加长期 ICMP 延迟采集。每个节点在每个 OSWbb 快照周期内，分别使用 56 字节和 8192 字节负载探测另外两个节点。`oswbb-analyse` 读取归档结果，输出长期延迟和丢包统计。
 
-## Packet Semantics
+## 报文口径
 
-- `56` and `8192` are ICMP payload sizes passed to `ping -s`.
-- The 56-byte probe is the normal small-packet baseline.
-- With MTU 1500, the 8192-byte probe is fragmented at IPv4 and reassembled by the destination. It therefore measures the fragmented large-message path, not one jumbo Ethernet frame.
-- The large probe must not use `-M do`, because that would reject an 8192-byte payload on an MTU-1500 path instead of measuring it.
-- Collection uses one probe per target and size per OSWbb interval. Long-running percentiles are calculated from the accumulated samples.
+- `56` 和 `8192` 是传递给 `ping -s` 的 ICMP 负载字节数。
+- 56 字节探测作为普通小包基线。
+- 在 MTU 1500 环境中，8192 字节探测会在 IPv4 层分片，并由目标节点重组。因此，它监控的是分片大报文链路，而不是单个巨型以太网帧。
+- 大包探测不能使用 `-M do`，否则 MTU 1500 路径会直接拒绝 8192 字节负载，无法进行延迟测量。
+- 每个 OSWbb 采集周期，对每个目标和每种报文大小各发送一次探测。长期百分位数据由持续积累的样本计算得到。
 
-## Collection Architecture
+## 采集架构
 
-The implementation follows the same pattern as the existing `vmstat`, `iostat`, `top`, and other OSWbb collectors:
+实现方式沿用现有 `vmstat`、`iostat`、`top` 等 OSWbb 采集器的模式：
 
-1. `OSWatcher.sh` detects `ping`, creates `archive/oswlatency`, manages a `latencylock.file`, creates hourly files, compresses the previous hour, and invokes a dedicated child collector.
-2. `latencysub.sh` writes one timestamped collection block to the hourly file, probes every configured peer at both payload sizes, records a structured result line, and always releases its lock.
-3. `OSWatcherFM.sh` applies the configured hourly retention policy to `archive/oswlatency` exactly as it does for the existing archive directories.
-4. `stopOSWbb.sh` needs no separate daemon handling because the collector remains a bounded child of the OSWatcher loop.
+1. `OSWatcher.sh` 检测 `ping` 命令、创建 `archive/oswlatency`、管理 `latencylock.file`、创建小时文件、压缩上一小时文件，并调用独立的子采集脚本。
+2. `latencysub.sh` 向小时文件写入一个带时间戳的采集块，对所有已配置对端分别执行两种报文大小的探测，写入结构化结果，并保证释放锁文件。
+3. `OSWatcherFM.sh` 按照现有归档目录的处理方式，对 `archive/oswlatency` 应用已配置的小时级保留策略。
+4. `stopOSWbb.sh` 无需管理额外守护进程，因为延迟采集器仍然是 OSWatcher 主循环启动的有界子进程。
 
-No standalone service, cron job, `fping` dependency, or alternate retention mechanism is introduced.
+不引入独立服务、cron 任务、`fping` 依赖或另一套保留机制。
 
-## Target Configuration
+## 目标配置
 
-Each node has an `oswlatency.conf` file in the OSWbb installation directory. Each non-comment line contains a stable node name and an IPv4 address separated by whitespace:
+每个节点在 OSWbb 安装目录中保存一个 `oswlatency.conf` 文件。每一条非注释行由稳定的节点名称和 IPv4 地址组成，字段之间使用空白字符分隔：
 
 ```text
 node2 10.0.0.12
 node3 10.0.0.13
 ```
 
-Each node lists only its two remote peers. This produces six directed paths across the cluster and avoids meaningless loopback samples. Blank lines and lines beginning with `#` are ignored. Invalid lines are logged as collection errors without stopping valid targets.
+每个节点只配置另外两个对端，从而在三节点集群中形成 6 条有方向的链路，并避免没有实际意义的本机回环样本。空行和以 `#` 开头的行会被忽略。无效配置行会记录为采集错误，但不会阻止其他有效目标继续采集。
 
-## Probe Execution And Archive Format
+## 探测命令与归档格式
 
-The Linux collector runs the equivalent of:
+Linux 采集器执行的命令等价于：
 
 ```sh
 ping -n -c 1 -W 1 -s 56 TARGET
 ping -n -c 1 -W 1 -s 8192 TARGET
 ```
 
-It inherits OSWbb's `LC_ALL=C`. Every attempt emits one machine-readable line while retaining the raw command output for operator inspection:
+采集器继承 OSWbb 的 `LC_ALL=C` 环境。每次探测都会写入一条机器可读记录，同时保留原始命令输出，方便运维人员直接检查：
 
 ```text
 OSWLATENCY|timestamp=2026-07-10T12:00:00+0800|source=node1|target=node2|address=10.0.0.12|size=56|status=ok|rtt_ms=0.183
 OSWLATENCY|timestamp=2026-07-10T12:00:01+0800|source=node1|target=node2|address=10.0.0.12|size=8192|status=timeout|rtt_ms=
 ```
 
-Supported statuses are `ok`, `timeout`, `config_error`, and `ping_error`. A missing `ping` binary disables only this collector and produces an explicit OSWatcher warning.
+支持的状态值为 `ok`、`timeout`、`config_error` 和 `ping_error`。系统缺少 `ping` 命令时，只禁用延迟采集器，并由 OSWatcher 输出明确告警。
 
-## Offline Analysis
+## 离线分析
 
-`oswbb-analyse` gains a latency file type and module following the current module registry and report pipeline. It recognizes hourly files under `oswlatency` by filename, parses only `OSWLATENCY|` records, and groups data by source, target, address, and payload size.
+`oswbb-analyse` 按照当前模块注册表和报告流水线增加延迟文件类型与分析模块。工具通过文件名识别 `oswlatency` 目录下的小时文件，只解析以 `OSWLATENCY|` 开头的结构化记录，并按照源节点、目标节点、目标地址和报文大小分组。
 
-For each directed path and size, reports contain:
+每条有方向的链路和每种报文大小均输出以下指标：
 
-- attempted and successful samples;
-- loss count and loss percentage;
-- minimum, average, maximum, P50, P95, and P99 RTT;
-- first and last sample timestamps.
+- 尝试样本数和成功样本数；
+- 丢包数量和丢包率；
+- RTT 最小值、平均值、最大值、P50、P95 和 P99；
+- 第一条和最后一条样本的时间戳。
 
-For each directed path, the report also shows the 8192-byte versus 56-byte average and P95 difference and ratio. If small probes succeed while large probes fail, the report labels it as a fragmented-large-packet path failure and recommends checking fragmentation filtering, reassembly limits, and path behavior. It does not claim that MTU 1500 alone is a fault.
+每条有方向的链路还会输出 8192 字节相对于 56 字节的平均延迟差值、平均延迟倍率、P95 差值和 P95 倍率。如果小包成功而大包失败，报告会标记为分片大报文链路故障，并建议检查分片过滤、重组限制和链路行为；不会直接把 MTU 1500 判定为故障。
 
-Report, CSV, JSON, and HTML outputs reuse the existing output pipeline. No environment-specific absolute latency threshold is hard-coded; the feature reports measured values and the directly supported small-versus-large comparison.
+文本报告、CSV、JSON 和 HTML 输出复用现有输出流水线。不设置依赖具体环境的绝对延迟阈值，只报告实测数据及有直接证据支撑的大小包对比结果。
 
-## Error Handling
+## 错误处理
 
-- The child collector has a bounded one-second timeout per probe and releases the OSWbb lock through a shell trap.
-- One failed target or size does not prevent the remaining probes.
-- A missing or empty configuration produces an explicit archive record and releases the lock.
-- Malformed structured records are skipped by the analyzer and surfaced as diagnostics; valid records in the same file remain usable.
-- Gzip-compressed hourly files continue through the existing archive processing path.
+- 子采集器对每次探测设置一秒超时，并通过 shell trap 释放 OSWbb 锁文件。
+- 单个目标或某种报文大小探测失败，不影响剩余探测继续执行。
+- 配置文件不存在或为空时，写入明确的归档错误记录并释放锁文件。
+- 分析器跳过格式错误的结构化记录并输出诊断信息，同一文件中的有效记录仍可继续使用。
+- gzip 压缩的小时文件继续复用现有归档处理流程。
 
-## Tests
+## 测试
 
-Implementation follows red-test-first development:
+实现阶段采用测试先行方式：
 
-1. Shell tests use a fake `ping` in `PATH` to prove that each configured peer is probed once with size 56 and once with size 8192, and that success, timeout, malformed configuration, and lock cleanup are recorded correctly.
-2. Parser tests cover successful samples, timeouts, malformed lines, mixed raw output, multiple nodes, and compressed hourly fixtures.
-3. Analyzer tests verify loss calculations, percentile boundaries, directed-path grouping, and 56-versus-8192 comparison.
-4. Registry and path-detection tests prove an OSWbb archive root automatically discovers the new module without changing existing module behavior.
-5. Focused tests are followed by `GOCACHE=/private/tmp/oswbb-ay-go-build go test ./...` and shell syntax checks.
+1. Shell 测试通过在 `PATH` 中放置模拟 `ping`，验证每个已配置对端分别使用 56 和 8192 字节探测一次，并正确记录成功、超时、配置错误和锁清理结果。
+2. 解析器测试覆盖成功样本、超时、格式错误记录、混合原始输出、多节点数据以及压缩后的小时文件。
+3. 分析器测试验证丢包计算、百分位边界、有方向链路分组和 56/8192 对比。
+4. 模块注册和路径识别测试验证：输入 OSWbb 归档根目录时能够自动发现新模块，同时不改变现有模块行为。
+5. 完成针对性测试后，执行 `GOCACHE=/private/tmp/oswbb-ay-go-build go test ./...` 和 shell 语法检查。
 
-## Three-Node Acceptance
+## 三节点验收标准
 
-The feature is complete only when all three nodes run the modified OSWbb collector with two peer entries each and current archive evidence proves:
+只有在三个节点均运行修改后的 OSWbb 采集器、每个节点配置两个对端，并由当前归档证据证明以下条件后，功能才算完成：
 
-- every node produces hourly `oswlatency` files;
-- all six directed paths contain both size 56 and size 8192 records over multiple intervals;
-- hourly compression and configured retention work;
-- `oswbb-analyse` reads the collected archive and reports both packet sizes, loss, percentiles, and small-versus-large comparison;
-- collector failures do not stop the existing OSWbb modules.
+- 每个节点都能生成按小时保存的 `oswlatency` 文件；
+- 全部 6 条有方向的链路在多个采集周期中均包含 56 和 8192 字节记录；
+- 小时文件压缩和已配置的保留策略正常工作；
+- `oswbb-analyse` 能读取采集归档，并输出两种报文大小、丢包率、百分位以及大小包对比；
+- 延迟采集器故障不会导致现有 OSWbb 模块停止采集。
 
-Node addresses and remote access are deployment inputs, not values embedded in the implementation.
+节点地址和远程访问方式属于部署输入，不会写死在实现中。
