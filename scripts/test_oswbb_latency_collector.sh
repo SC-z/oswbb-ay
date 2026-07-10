@@ -120,8 +120,11 @@ done
 
 patch_file="$root/release/oswbb-latency/OSWatcher-latency.patch"
 example_conf="$root/release/oswbb-latency/oswlatency.conf.example"
+deployment_doc="$root/release/oswbb-latency/DEPLOYMENT.md"
 test -f "$patch_file"
 test -f "$example_conf"
+test -f "$deployment_doc"
+grep -q '不解析 RTT' "$deployment_doc"
 
 mkdir -p "$tmp/oswbb"
 cp "$root/other/oswbb-upstream/OSWatcher.sh" "$tmp/oswbb/OSWatcher.sh"
