@@ -1,6 +1,7 @@
 package findings
 
 import (
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -248,6 +249,11 @@ func parseRealArchiveTop(t *testing.T, dir string) *top.TopLog {
 
 func requireArchiveFiles(t *testing.T, dir, pattern string, want int) []string {
 	t.Helper()
+	if _, err := os.Stat(dir); os.IsNotExist(err) {
+		t.Skipf("跳过需要本地真实 OSWbb archive 的回归测试: %s", dir)
+	} else if err != nil {
+		t.Fatalf("检查 archive 目录失败 %s: %v", dir, err)
+	}
 	files, err := filepath.Glob(filepath.Join(dir, pattern))
 	if err != nil {
 		t.Fatalf("archive glob 失败: %v", err)

@@ -1312,6 +1312,11 @@ Tasks: 2191 total,   8 running, 2183 sleeping,   0 stopped,   0 zombie
 
 func TestBuildTopFindingsRealArchiveKeepsHighCPUProcessCandidateWhenSystemIdle(t *testing.T) {
 	filename := filepath.Join("..", "..", "other", "archive", "oswtop", "rdsmaster1_top_26.04.21.0300.dat")
+	if _, err := os.Stat(filename); os.IsNotExist(err) {
+		t.Skipf("跳过需要本地真实 OSWbb archive 的回归测试: %s", filename)
+	} else if err != nil {
+		t.Fatalf("检查 archive 文件失败: %v", err)
+	}
 	log, err := top.NewTopParser().ParseFile(filename)
 	if err != nil {
 		t.Fatalf("ParseFile 返回错误: %v", err)
