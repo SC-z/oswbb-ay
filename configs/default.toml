@@ -1,0 +1,89 @@
+[general]
+default_output_format = "report"
+time_zone = "CST"
+
+[iostat]
+enabled = true
+queue_hard = 1.0
+queue_soft = 0.3
+cpu_wait_hard_pct = 20
+cpu_wait_soft_pct = 10
+latency_iops_soft = 10
+util_hard_pct = 95
+util_soft_pct = 80
+util_min_samples = 3
+nvme_latency_hard_ms = 8
+nvme_latency_soft_ms = 6
+default_latency_hard_ms = 50
+default_latency_soft_ms = 37.5
+latency_z_score_threshold = 3
+latency_mad_threshold = 3
+latency_iqr_multiplier = 1.5
+
+[meminfo]
+enabled = true
+available_warn_pct = 20
+available_soft_pct = 30
+available_severe_pct = 10
+available_severe_mb = 8192
+available_warn_mb = 16384
+anon_leak_hard_mb = 200
+anon_leak_soft_mb = 128
+anon_leak_delta_mb = 200
+anon_leak_hard_rate_mb_per_sample = 50
+anon_leak_soft_rate_mb_per_sample = 20
+anon_sample_seconds = 5
+anon_leak_hard_pct = 5
+anon_leak_soft_pct = 1
+swap_warn_pct = 10
+swap_severe_pct = 10
+swap_growth_soft_mb = 128
+swap_burst_pct = 20
+commit_warn_pct = 90
+commit_hard_pct = 100
+slab_warn_mb = 20480
+slab_soft_mb = 10240
+slab_warn_pct = 8
+slab_soft_pct = 4
+unreclaim_warn_pct = 2
+unreclaim_soft_pct = 1
+dirty_soft_pct = 2
+dirty_hard_pct = 5
+writeback_soft_pct = 0.2
+writeback_hard_pct = 1.0
+writeback_soft_mb = 256
+writeback_hard_mb = 1024
+anon_window_points = 36
+short_window_points = 36
+long_window_points = 720
+slope_burst_mb_per_sample = 500
+slab_slope_burst_mb_per_sample = 200
+kernel_abs_warn_mb = 500
+kernel_delta_pct_warn = 50
+v_pattern_drop_mb = 4096
+v_pattern_recover_mb = 2048
+sudden_change_pct = 2
+sudden_change_min_mb = 2048
+
+[top]
+enabled = true
+cpu_idle_hard_pct = 10
+cpu_idle_soft_pct = 20
+cpu_wait_hard_pct = 20
+cpu_wait_soft_pct = 10
+cpu_steal_hard_pct = 10
+cpu_steal_soft_pct = 5
+load_high_soft = 4
+load_high_hard = 8
+load_per_cpu_soft = 0.70
+load_per_cpu_hard = 1.00
+runnable_per_cpu = 0.70
+runnable_soft = 8
+cpu_idle_high_pct = 80
+high_cpu_process_pct = 50
+high_memory_process_pct = 5
+
+[ai]
+enabled = false
+default_output_format = "ml"
+timeout_seconds = 0

@@ -4,10 +4,10 @@ import (
 	"bufio"
 	"fmt"
 	"os"
+	"oswbb-analyse/pkg/common"
 	"strconv"
 	"strings"
 	"time"
-	"oswbb-analyse/pkg/common"
 )
 
 // MemStatData 内存状态数据快照
@@ -19,11 +19,11 @@ type MemStatData struct {
 // MemStats 内存统计信息
 type MemStats struct {
 	// 基础内存信息
-	MemTotal     int64 `json:"mem_total"`      // 总内存
-	MemFree      int64 `json:"mem_free"`       // 空闲内存
-	MemAvailable int64 `json:"mem_available"`  // 可用内存
-	Buffers      int64 `json:"buffers"`        // 缓冲区
-	Cached       int64 `json:"cached"`         // 缓存
+	MemTotal     int64 `json:"mem_total"`     // 总内存
+	MemFree      int64 `json:"mem_free"`      // 空闲内存
+	MemAvailable int64 `json:"mem_available"` // 可用内存
+	Buffers      int64 `json:"buffers"`       // 缓冲区
+	Cached       int64 `json:"cached"`        // 缓存
 
 	// 活跃/非活跃内存
 	Active   int64 `json:"active"`   // 活跃内存
@@ -36,9 +36,10 @@ type MemStats struct {
 	InactiveFile int64 `json:"inactive_file"` // 非活跃文件页
 
 	// 交换区信息
-	SwapTotal  int64 `json:"swap_total"`  // 交换区总量
-	SwapFree   int64 `json:"swap_free"`   // 交换区空闲
-	SwapCached int64 `json:"swap_cached"` // 交换缓存
+	SwapTotal       int64 `json:"swap_total"`  // 交换区总量
+	SwapFree        int64 `json:"swap_free"`   // 交换区空闲
+	SwapFreePresent bool  `json:"-"`           // SwapFree字段是否存在
+	SwapCached      int64 `json:"swap_cached"` // 交换缓存
 
 	// 其他重要指标
 	AnonPages    int64 `json:"anon_pages"`    // 匿名页总数
@@ -52,6 +53,7 @@ type MemStats struct {
 	PageTables   int64 `json:"page_tables"`   // 页表
 	Percpu       int64 `json:"percpu"`        // Percpu
 	KReclaimable int64 `json:"k_reclaimable"` // 可回收内核内存
+	CommitLimit  int64 `json:"commit_limit"`  // 内存提交上限
 	Committed    int64 `json:"committed"`     // 已提交内存
 	VmallocUsed  int64 `json:"vmalloc_used"`  // Vmalloc使用
 
@@ -64,6 +66,21 @@ type MemStats struct {
 // MemInfoLog 完整内存日志结构
 type MemInfoLog struct {
 	Data []MemStatData `json:"data"`
+}
+
+// EffectiveMemAvailableKB returns MemAvailable or a conservative fallback for older meminfo snapshots.
+func EffectiveMemAvailableKB(stats MemStats) int64 {
+	if stats.MemAvailable > 0 {
+		return stats.MemAvailable
+	}
+	available := stats.MemFree + stats.Buffers + stats.Cached + stats.SReclaimable
+	if available < 0 {
+		return 0
+	}
+	if stats.MemTotal > 0 && available > stats.MemTotal {
+		return stats.MemTotal
+	}
+	return available
 }
 
 // MemInfoParser 解析器
@@ -96,6 +113,7 @@ func (p *MemInfoParser) ParseFile(filename string) (*MemInfoLog, error) {
 			// 解析时间戳
 			timestamp, err := p.parseTimestamp(line)
 			if err != nil {
+				currentSnapshot = nil
 				continue
 			}
 			// 创建新的快照
@@ -179,6 +197,7 @@ func (p *MemInfoParser) parseMemoryLine(line string, memStats *MemStats) {
 		memStats.SwapTotal = value
 	case "SwapFree":
 		memStats.SwapFree = value
+		memStats.SwapFreePresent = true
 	case "SwapCached":
 		memStats.SwapCached = value
 	case "AnonPages":
@@ -203,6 +222,8 @@ func (p *MemInfoParser) parseMemoryLine(line string, memStats *MemStats) {
 		memStats.Percpu = value
 	case "KReclaimable":
 		memStats.KReclaimable = value
+	case "CommitLimit":
+		memStats.CommitLimit = value
 	case "Committed_AS":
 		memStats.Committed = value
 	case "VmallocUsed":
@@ -235,7 +256,8 @@ func (log *MemInfoLog) GetMemoryUsageTrend(startTime, endTime time.Time) common.
 
 		// 计算内存使用率：(Total - Available) / Total * 100
 		if data.MemStats.MemTotal > 0 {
-			usagePercent := float64(data.MemStats.MemTotal-data.MemStats.MemAvailable) / float64(data.MemStats.MemTotal) * 100
+			available := EffectiveMemAvailableKB(data.MemStats)
+			usagePercent := float64(data.MemStats.MemTotal-available) / float64(data.MemStats.MemTotal) * 100
 			result = append(result, common.TimeValue{
 				Time:  data.Timestamp,
 				Value: usagePercent,

@@ -11,6 +11,9 @@ type TopSnapshot struct {
 	Load5  float64 `json:"load_5"`
 	Load15 float64 `json:"load_15"`
 
+	// Target host CPU count when available from OSWbb companion files.
+	CPUCount int `json:"cpu_count,omitempty"`
+
 	// Tasks
 	TaskTotal    int `json:"task_total"`
 	TaskRunning  int `json:"task_running"`
@@ -27,6 +30,20 @@ type TopSnapshot struct {
 	CpuHi    float64 `json:"cpu_hi"`
 	CpuSi    float64 `json:"cpu_si"`
 	CpuSteal float64 `json:"cpu_steal"`
+
+	Processes []ProcessStats `json:"processes,omitempty"`
+}
+
+type ProcessStats struct {
+	PID        int     `json:"pid"`
+	User       string  `json:"user"`
+	State      string  `json:"state"`
+	CPUPercent float64 `json:"cpu_percent"`
+	MemPercent float64 `json:"mem_percent"`
+	VirtKB     int64   `json:"virt_kb"`
+	ResKB      int64   `json:"res_kb"`
+	ShrKB      int64   `json:"shr_kb"`
+	Command    string  `json:"command"`
 }
 
 // TopLog 包含所有解析后的快照

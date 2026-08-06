@@ -62,7 +62,7 @@ type DeviceStats struct {
 
 	// 队列和利用率
 	AvgQueueSize float64 `json:"aqu_sz"`
-	// Utilization  float64 `json:"util"`
+	Utilization  float64 `json:"util"`
 }
 
 // IOStatLog 完整日志结构
@@ -107,6 +107,7 @@ func (p *IOStatParser) ParseFile(filename string) (*IOStatLog, error) {
 			// 解析时间戳
 			timestamp, err := p.parseTimestamp(line)
 			if err != nil {
+				currentSnapshot = nil
 				continue
 			}
 			// 创建新的快照点
@@ -224,6 +225,12 @@ func (p *IOStatParser) fillDeviceStatsFromHeader(fields []string, device *Device
 		device.WriteMergePerSec = val
 		parsedAny = true
 	}
+	if val, ok := p.getFieldFloat(fields, "%rrqm"); ok {
+		device.ReadMergePct = val
+	}
+	if val, ok := p.getFieldFloat(fields, "%wrqm"); ok {
+		device.WriteMergePct = val
+	}
 
 	// await：优先 r_await / w_await，缺失时用 await 兜底
 	readAwait, okReadAwait := p.getFieldFloat(fields, "r_await")
@@ -251,6 +258,10 @@ func (p *IOStatParser) fillDeviceStatsFromHeader(fields []string, device *Device
 
 	if val, ok := p.getFieldFloat(fields, "aqu-sz", "avgqu-sz"); ok {
 		device.AvgQueueSize = val
+		parsedAny = true
+	}
+	if val, ok := p.getFieldFloat(fields, "%util"); ok {
+		device.Utilization = val
 		parsedAny = true
 	}
 
@@ -356,12 +367,7 @@ func (p *IOStatParser) parseDeviceStats(line string) (DeviceStats, error) {
 		return DeviceStats{}, fmt.Errorf("invalid device stats line")
 	}
 
-	// 跳过RAID设备(md*)
 	deviceName := fields[0]
-	if strings.HasPrefix(deviceName, "md") {
-		// 忽略RAID设备
-		return DeviceStats{}, fmt.Errorf("skipping RAID device: %s", deviceName)
-	}
 
 	device := DeviceStats{
 		Device: deviceName,
@@ -404,7 +410,7 @@ func (p *IOStatParser) parseDeviceStats(line string) (DeviceStats, error) {
 		device.WriteReqSize = values[12]    // wareq-sz
 		// values[13] = svctm (服务时间，暂不使用)ls
 
-		// device.Utilization = values[14] // %util
+		device.Utilization = values[14] // %util
 
 		// 新格式没有discard相关字段，设为0
 		device.DiscardReqPerSec = 0
@@ -445,7 +451,7 @@ func (p *IOStatParser) parseDeviceStats(line string) (DeviceStats, error) {
 		device.DiscardAwait = values[16]       // d_await
 		device.DiscardReqSize = values[17]     // dareq-sz
 		device.AvgQueueSize = values[18]       // aqu-sz
-		// device.Utilization = values[19]        // %util
+		device.Utilization = values[19]        // %util
 
 	} else {
 		return device, fmt.Errorf("unsupported iostat format: expected 15 or 20 fields, got %d", numFields)
@@ -502,7 +508,7 @@ func (log *IOStatLog) GetWriteLatencyTrend(deviceName string, startTime, endTime
 // 	return common.TimeValueList(result)
 // }
 
-// GetIOPSTrend 获取IOPS趋势（读+写请求）
+// GetIOPSTrend 获取IOPS趋势（读+写+discard请求）
 func (log *IOStatLog) GetIOPSTrend(deviceName string, startTime, endTime time.Time) common.TimeValueList {
 	var result []common.TimeValue
 
@@ -513,7 +519,7 @@ func (log *IOStatLog) GetIOPSTrend(deviceName string, startTime, endTime time.Ti
 
 		for _, device := range data.Devices {
 			if device.Device == deviceName {
-				iops := device.ReadReqPerSec + device.WriteReqPerSec
+				iops := device.ReadReqPerSec + device.WriteReqPerSec + device.DiscardReqPerSec
 				result = append(result, common.TimeValue{
 					Time:  data.Timestamp,
 					Value: iops,
@@ -554,16 +560,16 @@ func (log *IOStatLog) GetTimeRange() (time.Time, time.Time) {
 
 // LatencyStats 延迟统计结构
 type LatencyStats struct {
-	Mean       float64 // 均值
-	StdDev     float64 // 标准差
-	Variance   float64 // 方差
-	MAD        float64 // 中位绝对偏差
-	P50        float64 // 中位数
-	P90        float64 // 90百分位
-	P95        float64 // 95百分位
-	P99        float64 // 99百分位
-	Count      int     // 样本数量
-	Anomalies  []AnomalyPoint // 异常点
+	Mean      float64        // 均值
+	StdDev    float64        // 标准差
+	Variance  float64        // 方差
+	MAD       float64        // 中位绝对偏差
+	P50       float64        // 中位数
+	P90       float64        // 90百分位
+	P95       float64        // 95百分位
+	P99       float64        // 99百分位
+	Count     int            // 样本数量
+	Anomalies []AnomalyPoint // 异常点
 }
 
 // AnomalyPoint 异常点
@@ -575,8 +581,51 @@ type AnomalyPoint struct {
 	Method    string // 检测方法: "z-score", "iqr", "mad"
 }
 
+// LatencyThresholds controls latency anomaly detection.
+type LatencyThresholds struct {
+	NVMeMS        float64
+	DefaultMS     float64
+	ZScore        float64
+	MAD           float64
+	IQRMultiplier float64
+}
+
+func DefaultLatencyThresholds() LatencyThresholds {
+	return LatencyThresholds{
+		NVMeMS:        8,
+		DefaultMS:     50,
+		ZScore:        3,
+		MAD:           3,
+		IQRMultiplier: 1.5,
+	}
+}
+
+func (t LatencyThresholds) withDefaults() LatencyThresholds {
+	d := DefaultLatencyThresholds()
+	if t.NVMeMS != 0 {
+		d.NVMeMS = t.NVMeMS
+	}
+	if t.DefaultMS != 0 {
+		d.DefaultMS = t.DefaultMS
+	}
+	if t.ZScore != 0 {
+		d.ZScore = t.ZScore
+	}
+	if t.MAD != 0 {
+		d.MAD = t.MAD
+	}
+	if t.IQRMultiplier != 0 {
+		d.IQRMultiplier = t.IQRMultiplier
+	}
+	return d
+}
+
 // GetReadLatencyStats 获取指定设备的读延迟统计分析
 func (log *IOStatLog) GetReadLatencyStats(deviceName string, startTime, endTime time.Time) LatencyStats {
+	return log.GetReadLatencyStatsWithThresholds(deviceName, startTime, endTime, DefaultLatencyThresholds())
+}
+
+func (log *IOStatLog) GetReadLatencyStatsWithThresholds(deviceName string, startTime, endTime time.Time, thresholds LatencyThresholds) LatencyStats {
 	var values []float64
 	var timeValues []common.TimeValue
 
@@ -587,6 +636,9 @@ func (log *IOStatLog) GetReadLatencyStats(deviceName string, startTime, endTime 
 
 		for _, device := range data.Devices {
 			if device.Device == deviceName {
+				if !hasReadActivity(device) {
+					break
+				}
 				values = append(values, device.ReadAwait)
 				timeValues = append(timeValues, common.TimeValue{
 					Time:  data.Timestamp,
@@ -599,12 +651,16 @@ func (log *IOStatLog) GetReadLatencyStats(deviceName string, startTime, endTime 
 
 	stats := calculateLatencyStats(values)
 	// 执行异常检测，传入设备名称
-	stats.Anomalies = detectAnomalies(timeValues, stats, deviceName)
+	stats.Anomalies = detectAnomaliesWithThresholds(timeValues, stats, deviceName, thresholds)
 	return stats
 }
 
 // GetWriteLatencyStats 获取指定设备的写延迟统计分析
 func (log *IOStatLog) GetWriteLatencyStats(deviceName string, startTime, endTime time.Time) LatencyStats {
+	return log.GetWriteLatencyStatsWithThresholds(deviceName, startTime, endTime, DefaultLatencyThresholds())
+}
+
+func (log *IOStatLog) GetWriteLatencyStatsWithThresholds(deviceName string, startTime, endTime time.Time, thresholds LatencyThresholds) LatencyStats {
 	var values []float64
 	var timeValues []common.TimeValue
 
@@ -615,6 +671,9 @@ func (log *IOStatLog) GetWriteLatencyStats(deviceName string, startTime, endTime
 
 		for _, device := range data.Devices {
 			if device.Device == deviceName {
+				if !hasWriteActivity(device) {
+					break
+				}
 				values = append(values, device.WriteAwait)
 				timeValues = append(timeValues, common.TimeValue{
 					Time:  data.Timestamp,
@@ -627,8 +686,54 @@ func (log *IOStatLog) GetWriteLatencyStats(deviceName string, startTime, endTime
 
 	stats := calculateLatencyStats(values)
 	// 执行异常检测，传入设备名称
-	stats.Anomalies = detectAnomalies(timeValues, stats, deviceName)
+	stats.Anomalies = detectAnomaliesWithThresholds(timeValues, stats, deviceName, thresholds)
 	return stats
+}
+
+// GetDiscardLatencyStats 获取指定设备的 discard/TRIM 延迟统计分析
+func (log *IOStatLog) GetDiscardLatencyStats(deviceName string, startTime, endTime time.Time) LatencyStats {
+	return log.GetDiscardLatencyStatsWithThresholds(deviceName, startTime, endTime, DefaultLatencyThresholds())
+}
+
+func (log *IOStatLog) GetDiscardLatencyStatsWithThresholds(deviceName string, startTime, endTime time.Time, thresholds LatencyThresholds) LatencyStats {
+	var values []float64
+	var timeValues []common.TimeValue
+
+	for _, data := range log.Data {
+		if data.Timestamp.Before(startTime) || data.Timestamp.After(endTime) {
+			continue
+		}
+
+		for _, device := range data.Devices {
+			if device.Device == deviceName {
+				if !hasDiscardActivity(device) {
+					break
+				}
+				values = append(values, device.DiscardAwait)
+				timeValues = append(timeValues, common.TimeValue{
+					Time:  data.Timestamp,
+					Value: device.DiscardAwait,
+				})
+				break
+			}
+		}
+	}
+
+	stats := calculateLatencyStats(values)
+	stats.Anomalies = detectAnomaliesWithThresholds(timeValues, stats, deviceName, thresholds)
+	return stats
+}
+
+func hasReadActivity(device DeviceStats) bool {
+	return device.ReadReqPerSec > 0 || device.ReadKBPerSec > 0
+}
+
+func hasWriteActivity(device DeviceStats) bool {
+	return device.WriteReqPerSec > 0 || device.WriteKBPerSec > 0
+}
+
+func hasDiscardActivity(device DeviceStats) bool {
+	return device.DiscardReqPerSec > 0 || device.DiscardKBPerSec > 0
 }
 
 // calculateLatencyStats 计算延迟统计信息
@@ -705,23 +810,32 @@ func calculateMAD(sortedValues []float64, median float64) float64 {
 
 // getAnomalyThreshold 根据设备类型获取异常检测阈值
 func getAnomalyThreshold(deviceName string) float64 {
+	return getAnomalyThresholdWithThresholds(deviceName, DefaultLatencyThresholds())
+}
+
+func getAnomalyThresholdWithThresholds(deviceName string, thresholds LatencyThresholds) float64 {
+	thresholds = thresholds.withDefaults()
 	// 根据设备名称判断磁盘类型
 	if strings.HasPrefix(deviceName, "nvme") {
-		return 8.0 // nvme磁盘阈值: 8μs
+		return thresholds.NVMeMS
 	} else if strings.HasPrefix(deviceName, "sd") {
 		// ssd磁盘或传统机械磁盘(如sda, sdb等)
-		return 50.0 // ssd/传统磁盘阈值: 50μs
+		return thresholds.DefaultMS
 	}
-	// 默认阈值(其他未知设备类型)
-	return 8.0
+	return thresholds.DefaultMS
 }
 
 // detectAnomalies 异常检测
 func detectAnomalies(timeValues []common.TimeValue, stats LatencyStats, deviceName string) []AnomalyPoint {
-	var anomalies []AnomalyPoint
-	anomalyThreshold := getAnomalyThreshold(deviceName)
+	return detectAnomaliesWithThresholds(timeValues, stats, deviceName, DefaultLatencyThresholds())
+}
 
-	if stats.StdDev == 0 || stats.MAD == 0 {
+func detectAnomaliesWithThresholds(timeValues []common.TimeValue, stats LatencyStats, deviceName string, thresholds LatencyThresholds) []AnomalyPoint {
+	thresholds = thresholds.withDefaults()
+	var anomalies []AnomalyPoint
+	anomalyThreshold := getAnomalyThresholdWithThresholds(deviceName, thresholds)
+
+	if len(timeValues) == 0 {
 		return anomalies
 	}
 
@@ -739,22 +853,34 @@ func detectAnomalies(timeValues []common.TimeValue, stats LatencyStats, deviceNa
 		}
 
 		// Z-score检测
-		zScore := math.Abs(value-stats.Mean) / stats.StdDev
+		zScore := 0.0
+		isZScoreAnomaly := false
+		if stats.StdDev > 0 {
+			zScore = math.Abs(value-stats.Mean) / stats.StdDev
+			isZScoreAnomaly = zScore > thresholds.ZScore
+		}
 
 		// MAD检测
-		madScore := math.Abs(value-stats.P50) / stats.MAD
+		madScore := 0.0
+		isMADAnomaly := false
+		if stats.MAD > 0 {
+			madScore = math.Abs(value-stats.P50) / stats.MAD
+			isMADAnomaly = madScore > thresholds.MAD
+		}
 
 		// IQR检测
-		isIQRAnomaly := value < (q1-1.5*iqr) || value > (q3+1.5*iqr)
+		isIQRAnomaly := value < (q1-thresholds.IQRMultiplier*iqr) || value > (q3+thresholds.IQRMultiplier*iqr)
 
 		// 判定异常
 		method := ""
-		if zScore > 3 {
+		if isZScoreAnomaly {
 			method = "z-score"
-		} else if madScore > 3 {
+		} else if isMADAnomaly {
 			method = "mad"
 		} else if isIQRAnomaly {
 			method = "iqr"
+		} else {
+			method = "threshold"
 		}
 
 		if method != "" {
@@ -782,8 +908,8 @@ func extractValues(timeValues []common.TimeValue) []float64 {
 }
 
 // GetThroughputStats 获取设备吞吐量统计
-func (log *IOStatLog) GetThroughputStats(deviceName string, startTime, endTime time.Time) (readMax, writeMax, readAvg, writeAvg float64) {
-	var readValues, writeValues []float64
+func (log *IOStatLog) GetThroughputStats(deviceName string, startTime, endTime time.Time) (readMax, writeMax, discardMax, readAvg, writeAvg, discardAvg float64) {
+	var readValues, writeValues, discardValues []float64
 
 	for _, data := range log.Data {
 		if data.Timestamp.Before(startTime) || data.Timestamp.After(endTime) {
@@ -794,6 +920,7 @@ func (log *IOStatLog) GetThroughputStats(deviceName string, startTime, endTime t
 			if device.Device == deviceName {
 				readValues = append(readValues, device.ReadKBPerSec)
 				writeValues = append(writeValues, device.WriteKBPerSec)
+				discardValues = append(discardValues, device.DiscardKBPerSec)
 				break
 			}
 		}
@@ -817,6 +944,16 @@ func (log *IOStatLog) GetThroughputStats(deviceName string, startTime, endTime t
 			sum += v
 		}
 		writeAvg = sum / float64(len(writeValues))
+	}
+
+	if len(discardValues) > 0 {
+		sort.Float64s(discardValues)
+		discardMax = discardValues[len(discardValues)-1]
+		sum := 0.0
+		for _, v := range discardValues {
+			sum += v
+		}
+		discardAvg = sum / float64(len(discardValues))
 	}
 
 	return
