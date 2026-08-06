@@ -1,13 +1,24 @@
 package processor
 
 import (
+	"context"
 	"fmt"
 	"math"
+	"oswbb-analyse/internal/config"
+	"oswbb-analyse/internal/core"
+	"oswbb-analyse/internal/logging"
+	moduleiostat "oswbb-analyse/internal/modules/iostat"
+	modulememinfo "oswbb-analyse/internal/modules/meminfo"
+	internaloutput "oswbb-analyse/internal/output"
+	reportbase "oswbb-analyse/internal/report"
 	"oswbb-analyse/pkg/common"
+	"oswbb-analyse/pkg/diagnosis"
+	"oswbb-analyse/pkg/findings"
 	"oswbb-analyse/pkg/iostat"
 	"oswbb-analyse/pkg/meminfo"
 	"oswbb-analyse/pkg/output"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -18,39 +29,7 @@ const (
 	TimeShortLayout = "15:04:05"
 	// outputFormatReport 报告模式常量
 	outputFormatReport = "report"
-
-	// meminfo 分析窗口配置
-	memShortWindow = 36  // 短窗口采样点数
-	memLongWindow  = 720 // 长窗口采样点数
-
-	// meminfo 阈值配置
-	memAvailWarnPct   = 20.0
-	memAvailSeverePct = 10.0    // 更新为 10%
-	memAvailSevereMB  = 8192.0  // 8GB
-	memAvailWarnMB    = 16384.0 // 16GB
-
-	memSwapSeverePct      = 10.0
-	memUnreclaimPctThresh = 2.0
-
-	// Slab 告警配置
-	memSlabWarnMB  = 20480.0 // 20GB
-	memSlabWarnPct = 8.0
-
-	memAnonLeakDeltaMB         = 200.0
-	memAnonLeakRateMBPerSample = 50.0
-
-	memSwapBurstPct          = 20.0
-	memSlopeBurstMBPerSample = 500.0
-	memKernelAbsWarnMB       = 500.0
-	memKernelDeltaPctWarn    = 50.0
-
-	// V型波动检测配置
-	memVPatternDropMB    = 4096.0 // 4GB
-	memVPatternRecoverMB = 2048.0 // 2GB
-
-	// 突变检测配置
-	memSuddenChangePct   = 2.0    // 2%
-	memSuddenChangeMinMB = 2048.0 // 2GB
+	outputFormatML     = "ml"
 )
 
 // timeRangedLog 定义能够提供时间范围的日志接口
@@ -64,9 +43,39 @@ type analysisOptions struct {
 	startTimeStr      string
 	endTimeStr        string
 	location          *time.Location
+	hostname          string
 	introLines        []string
 	leadingBlankIntro bool
 	rangeScope        string
+	aiDiagnosis       diagnosis.AIResult
+	iostatConfig      config.IostatConfig
+	meminfoConfig     config.MeminfoConfig
+	topConfig         config.TopConfig
+	reportRunner      ModuleReportRunner
+	reportBundle      *core.AnalysisBundle
+	outputSink        internaloutput.OutputSink
+}
+
+func withDefaultAnalysisConfigs(opts analysisOptions) analysisOptions {
+	def := config.Default()
+	if opts.iostatConfig == (config.IostatConfig{}) {
+		opts.iostatConfig = def.Iostat
+	}
+	if opts.meminfoConfig == (config.MeminfoConfig{}) {
+		opts.meminfoConfig = def.Meminfo
+	}
+	if opts.topConfig == (config.TopConfig{}) {
+		opts.topConfig = def.Top
+	}
+	return opts
+}
+
+func (opts analysisOptions) reportConfig() config.Config {
+	cfg := config.Default()
+	cfg.Iostat = opts.iostatConfig
+	cfg.Meminfo = opts.meminfoConfig
+	cfg.Top = opts.topConfig
+	return cfg
 }
 
 // resolveTimeRange 解析时间范围，如果未指定则使用默认范围
@@ -77,8 +86,11 @@ func resolveTimeRange(log timeRangedLog, startTimeStr, endTimeStr string, cst *t
 
 	defaultStart, defaultEnd := log.GetTimeRange()
 
-	if startTimeStr == "" || endTimeStr == "" {
+	if startTimeStr == "" && endTimeStr == "" {
 		return defaultStart, defaultEnd, true, nil
+	}
+	if startTimeStr == "" || endTimeStr == "" {
+		return time.Time{}, time.Time{}, false, fmt.Errorf("请同时指定 -start 和 -end，或两个都不指定")
 	}
 
 	startTime, err := time.ParseInLocation(TimeLayout, startTimeStr, cst)
@@ -101,14 +113,14 @@ func printTimeRangeNotice(scope string, usedDefault bool, startTime, endTime tim
 	}
 
 	if usedDefault {
-		fmt.Printf("使用%s完整时间范围: %s 到 %s\n",
+		logging.Default().Infof("使用%s完整时间范围: %s 到 %s",
 			scope,
 			startTime.Format(TimeLayout),
 			endTime.Format(TimeLayout))
 		return
 	}
 
-	fmt.Printf("使用指定时间范围: %s 到 %s\n",
+	logging.Default().Infof("使用指定时间范围: %s 到 %s",
 		startTime.Format(TimeLayout),
 		endTime.Format(TimeLayout))
 }
@@ -129,6 +141,34 @@ func printIntro(lines []string, leadingBlank bool) {
 	fmt.Println()
 }
 
+func analysisOutputFilename(module, hostname, ext string) string {
+	timestamp := time.Now().Format("20060102150405_000000000")
+	safeHost := safeFilenamePart(hostname)
+	if safeHost == "" {
+		return fmt.Sprintf("%s_%s.%s", module, timestamp, ext)
+	}
+	return fmt.Sprintf("%s_%s_%s.%s", module, safeHost, timestamp, ext)
+}
+
+func safeFilenamePart(value string) string {
+	var builder strings.Builder
+	for _, char := range strings.TrimSpace(value) {
+		switch {
+		case char >= 'a' && char <= 'z':
+			builder.WriteRune(char)
+		case char >= 'A' && char <= 'Z':
+			builder.WriteRune(char)
+		case char >= '0' && char <= '9':
+			builder.WriteRune(char)
+		case char == '.', char == '-', char == '_':
+			builder.WriteRune(char)
+		default:
+			builder.WriteByte('_')
+		}
+	}
+	return strings.Trim(builder.String(), "_")
+}
+
 // executeAnalysisTemplate 执行通用的分析流程
 func executeAnalysisTemplate(
 	log timeRangedLog,
@@ -146,6 +186,10 @@ func executeAnalysisTemplate(
 		printIntro(opts.introLines, opts.leadingBlankIntro)
 		reportAction(startTime, endTime)
 		return nil
+	}
+
+	if useReportFormatterForExport(opts.outputFormat) {
+		return exportAction(startTime, endTime, nil)
 	}
 
 	formatter, err := output.CreateFormatter(opts.outputFormat)
@@ -185,22 +229,57 @@ func sortMemInfoDataByTimestamp(data []meminfo.MemStatData) {
 
 // analyzeIOStatLog 根据配置分析 iostat 日志
 func analyzeIOStatLog(log *iostat.IOStatLog, opts analysisOptions) error {
+	opts = withDefaultAnalysisConfigs(opts)
 	return executeAnalysisTemplate(log, opts,
 		func(start, end time.Time) {
-			printIOStatReport(log, start, end)
+			printIOStatReport(log, start, end, opts.iostatConfig)
 		},
 		func(start, end time.Time, formatter output.OutputFormatter) error {
 			rawMetrics := output.ConvertIOStatData(log, start, end)
 
 			ext := outputFileExt(opts.outputFormat)
-			filename := fmt.Sprintf("iostat_%s.%s", time.Now().Format("20060102150405"), ext)
-			return formatter.OutputIOStatData(rawMetrics, filename)
+			filename := analysisOutputFilename("iostat", opts.hostname, ext)
+			if useReportFormatterForExport(opts.outputFormat) {
+				report, err := opts.buildIOStatReport(log, start, end)
+				if err != nil {
+					return err
+				}
+				report.Title = "OSWbb IOStat 分析报告"
+				if opts.outputFormat == "html" {
+					if err := prepareHTMLExportReport(report, "iostat", rawMetrics, opts.aiDiagnosis); err != nil {
+						return err
+					}
+				}
+				return writeReportExportWithMessage(filename, "iostat", opts.outputFormat, report, opts.outputSink)
+			}
+			ioFindings := findings.BuildIOStatFindingsWithConfig(log, start, end, opts.iostatConfig)
+			return formatter.OutputIOStatData(output.IOStatExport{
+				Data:        rawMetrics,
+				AIDiagnosis: opts.aiDiagnosis,
+				Findings:    ioFindings,
+			}, filename)
 		},
 	)
 }
 
+func (opts analysisOptions) buildIOStatReport(log *iostat.IOStatLog, start, end time.Time) (*reportbase.Report, error) {
+	if opts.reportRunner != nil && opts.reportBundle != nil {
+		return opts.reportRunner.BuildModuleReport(context.Background(), core.FileTypeIOStat, opts.reportBundle, core.TimeRange{Start: start, End: end}, opts.reportConfig(), opts.aiDiagnosis)
+	}
+	analysis, err := moduleiostat.NewAnalyzer(opts.iostatConfig).AnalyzeRange(&moduleiostat.ParsedData{Log: log}, start, end)
+	if err != nil {
+		return nil, err
+	}
+	analysis.Diagnosis = opts.aiDiagnosis
+	return moduleiostat.BuildReport(analysis)
+}
+
 // printIOStatReport 打印 iostat 报告模式详情
-func printIOStatReport(log *iostat.IOStatLog, startTime, endTime time.Time) {
+func printIOStatReport(log *iostat.IOStatLog, startTime, endTime time.Time, cfgs ...config.IostatConfig) {
+	cfg := config.Default().Iostat
+	if len(cfgs) > 0 {
+		cfg = cfgs[0]
+	}
 	devices := log.GetAllDevices()
 	if len(devices) == 0 {
 		fmt.Println("未发现可用设备")
@@ -209,17 +288,61 @@ func printIOStatReport(log *iostat.IOStatLog, startTime, endTime time.Time) {
 
 	sort.Strings(devices)
 
-	fmt.Println("发现的设备:")
-	for _, device := range devices {
-		fmt.Printf("- %s\n", device)
-	}
-	fmt.Println()
+	if !printIOStatReportObject(log, devices, startTime, endTime, cfg) {
+		fmt.Print(output.RenderTextReportHeader("iostat"))
+		fmt.Print(output.RenderTextOverview("分析概览", []output.TextLine{
+			{Label: "时间范围", Value: fmt.Sprintf("%s ~ %s", startTime.Format(TimeLayout), endTime.Format(TimeLayout))},
+			{Label: "设备总数", Value: fmt.Sprintf("%d", len(devices))},
+		}))
 
-	fmt.Println("\n=== 活跃设备分析 ===")
+		fmt.Print(output.RenderTextSectionTitle("📋 设备列表"))
+		fmt.Println("发现的设备:")
+		for _, device := range devices {
+			fmt.Printf("- %s\n", device)
+		}
+		fmt.Println()
+
+		printFindingsSummary(findings.BuildIOStatFindingsWithConfig(log, startTime, endTime, cfg))
+	}
+
+	fmt.Print(output.RenderTextSectionTitle("📋 活跃设备分析"))
+	fmt.Println("=== 活跃设备分析 ===")
 	activeDevices := collectActiveDevices(log, devices, startTime, endTime)
 
-	fmt.Println("=== 延迟异常检测 ===")
+	fmt.Print(output.RenderTextSectionTitle("📈 延迟突增明细"))
+	fmt.Println("=== 延迟突增明细 ===")
 	printIOStatAnomalies(log, activeDevices, startTime, endTime)
+}
+
+func printIOStatReportObject(log *iostat.IOStatLog, devices []string, startTime, endTime time.Time, cfg config.IostatConfig) bool {
+	// Compatibility path: report-mode console output still appends legacy
+	// active-device and anomaly details after the formatted module report.
+	report, err := moduleiostat.BuildReport(&moduleiostat.Analysis{
+		Start:      startTime,
+		End:        endTime,
+		Devices:    append([]string(nil), devices...),
+		DataPoints: len(log.Data),
+		Findings:   findings.BuildIOStatFindingsWithConfig(log, startTime, endTime, cfg),
+	})
+	if err != nil {
+		return false
+	}
+	textReport := *report
+	if len(textReport.Summary) > 2 {
+		textReport.Summary = textReport.Summary[:2]
+	}
+	textReport.Tables = nil
+	return printReportText(&textReport)
+}
+
+func printReportText(report *reportbase.Report) bool {
+	data, err := internaloutput.TextFormatter{}.Format(report)
+	if err != nil {
+		logging.Default().Errorf("生成文本报告失败: %v", err)
+		return false
+	}
+	fmt.Print(string(data))
+	return true
 }
 
 // collectActiveDevices 输出活跃设备统计并返回设备列表
@@ -244,7 +367,7 @@ func collectActiveDevices(log *iostat.IOStatLog, devices []string, startTime, en
 	return activeDevices
 }
 
-// printIOStatAnomalies 打印延迟异常详情
+// printIOStatAnomalies 打印延迟突增详情
 func printIOStatAnomalies(log *iostat.IOStatLog, activeDevices []string, startTime, endTime time.Time) {
 	hasAnomalies := false
 
@@ -263,7 +386,7 @@ func printIOStatAnomalies(log *iostat.IOStatLog, activeDevices []string, startTi
 	}
 
 	if !hasAnomalies {
-		fmt.Println("未检测到明显的延迟异常 (所有异常点延迟 < 8μs)")
+		fmt.Println("无延迟突增明细")
 	}
 }
 
@@ -295,44 +418,113 @@ func mergeIOStatFiles(filenames []string, parser *iostat.IOStatParser) (*iostat.
 // logParseErrors 输出解析错误
 func logParseErrors(errs []error) {
 	for _, err := range errs {
-		fmt.Println(err)
+		logging.Default().Warnf("%v", err)
 	}
 }
 
 // analyzeMemInfoLog 根据配置分析 meminfo 日志
 func analyzeMemInfoLog(log *meminfo.MemInfoLog, opts analysisOptions, timeLayout string) error {
+	opts = withDefaultAnalysisConfigs(opts)
 	return executeAnalysisTemplate(log, opts,
 		func(start, end time.Time) {
-			printMemInfoReport(log, start, end, timeLayout)
+			printMemInfoReport(log, start, end, timeLayout, opts.meminfoConfig)
 		},
 		func(start, end time.Time, formatter output.OutputFormatter) error {
 			rawMetrics := output.ConvertMemInfoData(log, start, end)
 
 			ext := outputFileExt(opts.outputFormat)
-			filename := fmt.Sprintf("meminfo_%s.%s", time.Now().Format("20060102150405"), ext)
-			return formatter.OutputMemInfoData(rawMetrics, filename)
+			filename := analysisOutputFilename("meminfo", opts.hostname, ext)
+			if useReportFormatterForExport(opts.outputFormat) {
+				report, err := opts.buildMemInfoReport(log, start, end)
+				if err != nil {
+					return err
+				}
+				report.Title = "OSWbb MemInfo 分析报告"
+				if opts.outputFormat == "html" {
+					if err := prepareHTMLExportReport(report, "meminfo", rawMetrics, opts.aiDiagnosis); err != nil {
+						return err
+					}
+				}
+				return writeReportExportWithMessage(filename, "meminfo", opts.outputFormat, report, opts.outputSink)
+			}
+			memFindings := findings.BuildMemInfoFindingsWithConfig(log, start, end, opts.meminfoConfig)
+			return formatter.OutputMemInfoData(output.MemInfoExport{
+				Data:        rawMetrics,
+				AIDiagnosis: opts.aiDiagnosis,
+				Findings:    memFindings,
+			}, filename)
 		},
 	)
 }
 
+func (opts analysisOptions) buildMemInfoReport(log *meminfo.MemInfoLog, start, end time.Time) (*reportbase.Report, error) {
+	if opts.reportRunner != nil && opts.reportBundle != nil {
+		return opts.reportRunner.BuildModuleReport(context.Background(), core.FileTypeMeminfo, opts.reportBundle, core.TimeRange{Start: start, End: end}, opts.reportConfig(), opts.aiDiagnosis)
+	}
+	analysis, err := modulememinfo.NewAnalyzer(opts.meminfoConfig).AnalyzeRange(&modulememinfo.ParsedData{Log: log}, start, end)
+	if err != nil {
+		return nil, err
+	}
+	analysis.Diagnosis = opts.aiDiagnosis
+	return modulememinfo.BuildReport(analysis)
+}
+
+func printFindingsSummary(items []findings.Finding) {
+	fmt.Print(output.RenderFindingsSummary(items))
+}
+
+func findingNatureLabel(item findings.Finding) string {
+	nature := item.Nature
+	if nature == "" {
+		nature = findings.InferFindingNature(item)
+	}
+	switch nature {
+	case findings.FindingNatureCandidate:
+		return "候选线索"
+	case findings.FindingNatureRisk:
+		return "风险信号"
+	default:
+		return "风险信号"
+	}
+}
+
+func findingSeverityLabel(severity findings.Severity) string {
+	switch severity {
+	case findings.SeverityHigh:
+		return "高"
+	case findings.SeverityMedium:
+		return "中"
+	case findings.SeverityLow:
+		return "低"
+	default:
+		return "信息"
+	}
+}
+
 // printMemInfoReport 打印 meminfo 报告模式详情（短期/长期窗口对比 + 突变检测）
-func printMemInfoReport(log *meminfo.MemInfoLog, startTime, endTime time.Time, timeLayout string) {
+func printMemInfoReport(log *meminfo.MemInfoLog, startTime, endTime time.Time, timeLayout string, cfgs ...config.MeminfoConfig) {
+	cfg := config.Default().Meminfo
+	if len(cfgs) > 0 {
+		cfg = cfgs[0].WithDefaults()
+	}
 	data := filterMemInfoRange(log.Data, startTime, endTime)
 	if len(data) == 0 {
-		fmt.Println("指定时间范围内无 meminfo 数据")
+		logging.Default().Infof("指定时间范围内无 meminfo 数据")
 		return
 	}
 
-	shortWin := tailMemInfoWindow(data, memShortWindow)
-	longWin := tailMemInfoWindow(data, memLongWindow)
+	shortWin := tailMemInfoWindow(data, cfg.ShortWindowPoints)
+	longWin := tailMemInfoWindow(data, cfg.LongWindowPoints)
 	latest := data[len(data)-1]
 	memTotalKB := float64(latest.MemStats.MemTotal)
 	if memTotalKB == 0 {
-		fmt.Println("meminfo 数据缺少 MemTotal 字段，无法生成报告")
+		logging.Default().Warnf("meminfo 数据缺少 MemTotal 字段，无法生成报告")
 		return
 	}
 
-	availStats := buildSeriesStats(shortWin, longWin, func(ms meminfo.MemStats) float64 { return float64(ms.MemAvailable) })
+	memFindings := findings.BuildMemInfoFindingsWithConfig(log, startTime, endTime, cfg)
+
+	availStats := buildSeriesStats(shortWin, longWin, func(ms meminfo.MemStats) float64 { return float64(meminfo.EffectiveMemAvailableKB(ms)) })
 	anonStats := buildSeriesStats(shortWin, longWin, func(ms meminfo.MemStats) float64 { return float64(ms.AnonPages) })
 	slabStats := buildSeriesStats(shortWin, longWin, func(ms meminfo.MemStats) float64 { return float64(ms.Slab) })
 	swapStats := buildSeriesStats(shortWin, longWin, func(ms meminfo.MemStats) float64 { return float64(ms.SwapFree) })
@@ -344,13 +536,15 @@ func printMemInfoReport(log *meminfo.MemInfoLog, startTime, endTime time.Time, t
 		swapPct = pct(swapUsed, float64(latest.MemStats.SwapTotal))
 	}
 	unreclaimPct := pct(float64(latest.MemStats.SUnreclaim), memTotalKB)
+	commitPct := pct(float64(latest.MemStats.Committed), float64(latest.MemStats.CommitLimit))
 
 	memTotalMBVal := memTotalKB / 1024.0
 
-	availStatus := classifyAvail(availPct, kbToMB(availStats.current))
-	availAnomalies := findSignificantTrendChange(data, func(ms meminfo.MemStats) float64 { return float64(ms.MemAvailable) }, memSlopeBurstMBPerSample, memTotalMBVal)
-	vPatternAnomalies := detectVPattern(data, func(ms meminfo.MemStats) float64 { return float64(ms.MemAvailable) })
+	availStatus := classifyAvail(availPct, kbToMB(availStats.current), cfg)
+	availAnomalies := findSignificantTrendChangeWithConfig(data, func(ms meminfo.MemStats) float64 { return float64(meminfo.EffectiveMemAvailableKB(ms)) }, cfg.SlopeBurstMBPerSample, memTotalMBVal, cfg)
+	vPatternAnomalies := detectVPattern(data, func(ms meminfo.MemStats) float64 { return float64(meminfo.EffectiveMemAvailableKB(ms)) }, cfg)
 	availAnomalies = append(availAnomalies, vPatternAnomalies...)
+	availAnomalies = filterAvailablePressureAnomalies(availAnomalies, data, cfg)
 	// 重新排序
 	sort.Slice(availAnomalies, func(i, j int) bool {
 		return availAnomalies[i].Value > availAnomalies[j].Value
@@ -358,17 +552,22 @@ func printMemInfoReport(log *meminfo.MemInfoLog, startTime, endTime time.Time, t
 
 	anonDeltaMB := deltaMB(shortWin, func(ms meminfo.MemStats) float64 { return float64(ms.AnonPages) })
 	anonRateMB := anonStats.slopeShort
-	anonStatus := classifyAnon(anonDeltaMB, anonRateMB, availStats.slopeShort)
-	anonAnomalies := findSignificantTrendChange(data, func(ms meminfo.MemStats) float64 { return float64(ms.AnonPages) }, memSlopeBurstMBPerSample, memTotalMBVal)
+	anonStatus := classifyAnon(anonDeltaMB, anonRateMB, availStats.slopeShort, cfg)
+	anonAnomalies := findSignificantTrendChangeWithConfig(data, func(ms meminfo.MemStats) float64 { return float64(ms.AnonPages) }, cfg.SlopeBurstMBPerSample, memTotalMBVal, cfg)
+	anonAnomalies = appendFindingBackedMemInfoAnomalies(anonAnomalies, memFindings, "meminfo-anon-growth", timeLayout)
+	if anonStatus == "正常" && hasFindingRule(memFindings, "meminfo-anon-growth") {
+		anonStatus = "当前正常，历史有匿名页增长"
+	}
 
-	slabAnomalies := findSignificantTrendChange(data, func(ms meminfo.MemStats) float64 { return float64(ms.Slab) }, 200, memTotalMBVal)
+	slabAnomalies := findSignificantTrendChangeWithConfig(data, func(ms meminfo.MemStats) float64 { return float64(ms.Slab) }, cfg.SlabSlopeBurstMBPerSample, memTotalMBVal, cfg)
 
 	slabMB := kbToMB(float64(latest.MemStats.Slab))
 	slabPct := pct(float64(latest.MemStats.Slab), memTotalKB)
-	slabStatus := classifySlab(slabMB, slabPct)
-	unreclaimStatus := classifyUnreclaim(unreclaimPct, slabStats.slopeShort)
+	slabStatus := classifySlab(slabMB, slabPct, cfg)
+	unreclaimStatus := classifyUnreclaim(unreclaimPct, slabStats.slopeShort, cfg)
 
-	swapUsageStatus := classifySwapUsage(latest.MemStats.SwapFree, latest.MemStats.SwapTotal, swapPct, availPct)
+	swapUsageStatus := classifySwapUsage(latest.MemStats.SwapFree, latest.MemStats.SwapTotal, swapPct, availPct, cfg)
+	commitStatus := classifyCommitUsage(commitPct, latest.MemStats.CommitLimit, cfg)
 	deltaSwapPct := swapDeltaPct(shortWin, latest.MemStats.SwapTotal)
 
 	// Swap 异常检测
@@ -378,8 +577,8 @@ func printMemInfoReport(log *meminfo.MemInfoLog, startTime, endTime time.Time, t
 
 	if latest.MemStats.SwapTotal > 0 {
 		swapTotalMB := float64(latest.MemStats.SwapTotal) / 1024.0
-		swapThreshold := (swapTotalMB * (memSwapBurstPct / 100.0)) / float64(memShortWindow)
-		swapAnomalies = findSignificantTrendChange(data, func(ms meminfo.MemStats) float64 { return float64(ms.SwapFree) }, swapThreshold, memTotalMBVal)
+		swapThreshold := (swapTotalMB * (cfg.SwapBurstPct / 100.0)) / float64(cfg.ShortWindowPoints)
+		swapAnomalies = findSignificantTrendChangeWithConfig(data, func(ms meminfo.MemStats) float64 { return float64(ms.SwapFree) }, swapThreshold, memTotalMBVal, cfg)
 
 		for _, anomaly := range swapAnomalies {
 			if anomaly.Type == "骤降(单点)" || anomaly.Type == "骤降(趋势)" {
@@ -390,68 +589,78 @@ func printMemInfoReport(log *meminfo.MemInfoLog, startTime, endTime time.Time, t
 		}
 	}
 
-	kernelStatus, kernelDelta := classifyKernelOverhead(shortWin)
+	kernelStatus, kernelDelta := classifyKernelOverhead(shortWin, cfg)
 
-	fmt.Printf("\nOSWbb Meminfo 监控报告\n")
-	fmt.Printf("时间范围: %s ~ %s (短窗 %d 点, 长窗 %d 点)\n", startTime.Format(timeLayout), endTime.Format(timeLayout), memShortWindow, memLongWindow)
-	fmt.Printf("主机: %s\n\n", extractHostnameIfPossible(data))
-
-	fmt.Println("[概览]")
-	fmt.Printf("- 可用内存: %.1f%% (当前 %.2f GB / 总 %.2f GB)\n", availPct, kbToGB(availStats.current), kbToGB(memTotalKB))
+	var overview strings.Builder
+	overview.WriteString("[概览]\n")
+	fmt.Fprintf(&overview, "- 可用内存: %.1f%% (当前 %.2f GB / 总 %.2f GB)\n", availPct, kbToGB(availStats.current), kbToGB(memTotalKB))
 	swapMin, swapMax, swapAvg, hasSwap := summarizeSeries(data, func(ms meminfo.MemStats) float64 { return float64(ms.SwapFree) })
 	anonMin, anonMax, anonAvg, hasAnon := summarizeSeries(data, func(ms meminfo.MemStats) float64 { return float64(ms.AnonPages) })
-	fmt.Printf("- Swap: %.2f/%.2f GB (使用率 %.1f%%)", kbToGB(float64(latest.MemStats.SwapTotal-latest.MemStats.SwapFree)), kbToGB(float64(latest.MemStats.SwapTotal)), swapPct)
+	fmt.Fprintf(&overview, "- Swap: %.2f/%.2f GB (使用率 %.1f%%)", kbToGB(float64(latest.MemStats.SwapTotal-latest.MemStats.SwapFree)), kbToGB(float64(latest.MemStats.SwapTotal)), swapPct)
 	if hasSwap {
-		fmt.Printf("；可用范围 %.2f~%.2f GB，平均 %.2f GB\n", kbToGB(swapMin), kbToGB(swapMax), kbToGB(swapAvg))
+		fmt.Fprintf(&overview, "；可用范围 %.2f~%.2f GB，平均 %.2f GB\n", kbToGB(swapMin), kbToGB(swapMax), kbToGB(swapAvg))
 	} else {
-		fmt.Println()
+		overview.WriteString("\n")
 	}
-	fmt.Printf("- 匿名页(AnonPages): %.2f GB", kbToGB(anonStats.current))
+	fmt.Fprintf(&overview, "- 匿名页(AnonPages): %.2f GB", kbToGB(anonStats.current))
 	if hasAnon {
-		fmt.Printf("；范围 %.2f~%.2f GB，平均 %.2f GB\n", kbToGB(anonMin), kbToGB(anonMax), kbToGB(anonAvg))
+		fmt.Fprintf(&overview, "；范围 %.2f~%.2f GB，平均 %.2f GB\n", kbToGB(anonMin), kbToGB(anonMax), kbToGB(anonAvg))
 	} else {
-		fmt.Println()
+		overview.WriteString("\n")
 	}
-	fmt.Printf("- Slab: %.2f GB (不可回收 %.2f GB，可回收 %.2f GB)\n", kbToGB(float64(latest.MemStats.Slab)), kbToGB(float64(latest.MemStats.SUnreclaim)), kbToGB(float64(latest.MemStats.SReclaimable)))
-	fmt.Printf("- 内核栈/PageTables/Percpu: %.2f/%.2f/%.2f MB\n\n", kbToMB(float64(latest.MemStats.KernelStack)), kbToMB(float64(latest.MemStats.PageTables)), kbToMB(float64(latest.MemStats.Percpu)))
+	fmt.Fprintf(&overview, "- Slab: %.2f GB (不可回收 %.2f GB，可回收 %.2f GB)\n", kbToGB(float64(latest.MemStats.Slab)), kbToGB(float64(latest.MemStats.SUnreclaim)), kbToGB(float64(latest.MemStats.SReclaimable)))
+	if latest.MemStats.CommitLimit > 0 {
+		fmt.Fprintf(&overview, "- Commit: %.2f/%.2f GB (Committed_AS %.1f%%)\n", kbToGB(float64(latest.MemStats.Committed)), kbToGB(float64(latest.MemStats.CommitLimit)), commitPct)
+	}
+	fmt.Fprintf(&overview, "- 内核栈/PageTables/Percpu: %.2f/%.2f/%.2f MB\n\n", kbToMB(float64(latest.MemStats.KernelStack)), kbToMB(float64(latest.MemStats.PageTables)), kbToMB(float64(latest.MemStats.Percpu)))
 
-	fmt.Println("[告警与趋势]")
-	fmt.Printf("- 可用内存: %s；短期斜率 %.1f MB/点，Δs=%.1f；Z=%.2f；突变: %s\n",
+	var trends strings.Builder
+	trends.WriteString("[告警与趋势]\n")
+	fmt.Fprintf(&trends, "- 可用内存: %s；短期斜率 %.1f MB/点，Δs=%.1f；Z=%.2f；突变: %s\n",
 		availStatus, availStats.slopeShort, availStats.slopeShort-availStats.slopeLong, availStats.zScore, formatAnomalies(availAnomalies, timeLayout))
-	fmt.Printf("- 匿名页: %s；短窗增量 %.1f MB，平均变化 %.1f MB/点；突变: %s\n",
+	fmt.Fprintf(&trends, "- 匿名页: %s；短窗增量 %.1f MB，平均变化 %.1f MB/点；突变: %s\n",
 		anonStatus, anonDeltaMB, anonRateMB, formatAnomalies(anonAnomalies, timeLayout))
-	fmt.Printf("- Slab/Unreclaim: %s / %s；SUnreclaim占比 %.2f %%; 突变: %s\n",
+	fmt.Fprintf(&trends, "- Slab/Unreclaim: %s / %s；SUnreclaim占比 %.2f %%; 突变: %s\n",
 		slabStatus, unreclaimStatus, unreclaimPct, formatAnomalies(slabAnomalies, timeLayout))
-	fmt.Printf("- Swap 使用: %s；SwapPct=%.1f%%；短窗变化 %.1f%%；突发: %s @ %s\n",
+	fmt.Fprintf(&trends, "- Swap 使用: %s；SwapPct=%.1f%%；短窗变化 %.1f%%；突发: %s @ %s\n",
 		swapUsageStatus, swapPct, deltaSwapPct, swapBurst, formatTimeOrDash(swapChangeTime, timeLayout))
-	fmt.Printf("- 内核栈/页表/Percpu: %s；短窗增幅( MB ): %.1f/%.1f/%.1f\n",
+	fmt.Fprintf(&trends, "- Commit 提交: %s；Committed_AS %.1f%%\n", commitStatus, commitPct)
+	fmt.Fprintf(&trends, "- 内核栈/页表/Percpu: %s；短窗增幅( MB ): %.1f/%.1f/%.1f\n",
 		kernelStatus, kernelDelta.kernelStackMB, kernelDelta.pageTablesMB, kernelDelta.percpuMB)
-	fmt.Printf("- 大页: Total=%d, Free=%d, Size=%d kB\n\n", latest.MemStats.HugePagesTotal, latest.MemStats.HugePagesFree, latest.MemStats.Hugepagesize)
+	fmt.Fprintf(&trends, "- 大页: Total=%d, Free=%d, Size=%d kB\n\n", latest.MemStats.HugePagesTotal, latest.MemStats.HugePagesFree, latest.MemStats.Hugepagesize)
 
-	fmt.Println("[详细指标]")
-	fmt.Println("1) 可用内存")
-	fmt.Printf("   当前: %.2f GB (%.1f%%)\n", kbToGB(availStats.current), availPct)
-	fmt.Printf("   短/长期均值: %.2f / %.2f GB\n", kbToGB(availStats.meanShort), kbToGB(availStats.meanLong))
-	fmt.Printf("   斜率: s_short=%.1f MB/点, s_long=%.1f MB/点, Δs=%.1f\n", availStats.slopeShort, availStats.slopeLong, availStats.slopeShort-availStats.slopeLong)
-	fmt.Printf("   Z=%.2f, MAD=%.2f (KB)\n\n", availStats.zScore, availStats.mad)
+	var details strings.Builder
+	details.WriteString("[详细指标]\n")
+	details.WriteString("1) 可用内存\n")
+	fmt.Fprintf(&details, "   当前: %.2f GB (%.1f%%)\n", kbToGB(availStats.current), availPct)
+	fmt.Fprintf(&details, "   短/长期均值: %.2f / %.2f GB\n", kbToGB(availStats.meanShort), kbToGB(availStats.meanLong))
+	fmt.Fprintf(&details, "   斜率: s_short=%.1f MB/点, s_long=%.1f MB/点, Δs=%.1f\n", availStats.slopeShort, availStats.slopeLong, availStats.slopeShort-availStats.slopeLong)
+	fmt.Fprintf(&details, "   Z=%.2f, MAD=%.2f (KB)\n\n", availStats.zScore, availStats.mad)
 
-	fmt.Println("2) 匿名页 (AnonPages)")
-	fmt.Printf("   当前: %.2f GB；短窗增量 %.1f MB；平均变化 %.1f MB/点\n\n", kbToGB(anonStats.current), anonDeltaMB, anonRateMB)
+	details.WriteString("2) 匿名页 (AnonPages)\n")
+	fmt.Fprintf(&details, "   当前: %.2f GB；短窗增量 %.1f MB；平均变化 %.1f MB/点\n\n", kbToGB(anonStats.current), anonDeltaMB, anonRateMB)
 
-	fmt.Println("3) Slab")
-	fmt.Printf("   Slab: %.2f GB；SUnreclaim %.2f GB (%.2f%%)；SReclaimable %.2f GB\n\n", kbToGB(float64(latest.MemStats.Slab)), kbToGB(float64(latest.MemStats.SUnreclaim)), unreclaimPct, kbToGB(float64(latest.MemStats.SReclaimable)))
+	details.WriteString("3) Slab\n")
+	fmt.Fprintf(&details, "   Slab: %.2f GB；SUnreclaim %.2f GB (%.2f%%)；SReclaimable %.2f GB\n\n", kbToGB(float64(latest.MemStats.Slab)), kbToGB(float64(latest.MemStats.SUnreclaim)), unreclaimPct, kbToGB(float64(latest.MemStats.SReclaimable)))
 
-	fmt.Println("4) Swap")
-	fmt.Printf("   当前: %.2f/%.2f GB (%.1f%%)\n", kbToGB(swapStats.current), kbToGB(float64(latest.MemStats.SwapTotal)), swapPct)
-	fmt.Printf("   短窗变化: %.1f%% (%.2f GB)\n\n", deltaSwapPct, kbToGB(deltaSwapKB(shortWin)))
+	details.WriteString("4) Swap\n")
+	fmt.Fprintf(&details, "   当前: %.2f/%.2f GB (%.1f%%)\n", kbToGB(swapStats.current), kbToGB(float64(latest.MemStats.SwapTotal)), swapPct)
+	fmt.Fprintf(&details, "   短窗变化: %.1f%% (%.2f GB)\n\n", deltaSwapPct, kbToGB(deltaSwapKB(shortWin)))
 
-	fmt.Println("5) 内核栈 / PageTables / Percpu")
-	fmt.Printf("   当前: %.2f/%.2f/%.2f MB\n", kbToMB(float64(latest.MemStats.KernelStack)), kbToMB(float64(latest.MemStats.PageTables)), kbToMB(float64(latest.MemStats.Percpu)))
-	fmt.Printf("   短窗增幅: %.1f/%.1f/%.1f MB\n", kernelDelta.kernelStackMB, kernelDelta.pageTablesMB, kernelDelta.percpuMB)
-	fmt.Println("   说明: KernelStack=线程/协程栈，PageTables=内存映射页表，Percpu=每CPU局部缓存")
+	details.WriteString("5) Commit 提交内存\n")
+	if latest.MemStats.CommitLimit > 0 {
+		fmt.Fprintf(&details, "   当前: %.2f/%.2f GB (%.1f%%)\n\n", kbToGB(float64(latest.MemStats.Committed)), kbToGB(float64(latest.MemStats.CommitLimit)), commitPct)
+	} else {
+		details.WriteString("   缺少 CommitLimit，无法判断提交上限\n\n")
+	}
 
-	fmt.Println("6) 大页信息（仅报告）")
-	fmt.Printf("   HugePages_Total: %d, HugePages_Free: %d, Hugepagesize: %d kB\n", latest.MemStats.HugePagesTotal, latest.MemStats.HugePagesFree, latest.MemStats.Hugepagesize)
+	details.WriteString("6) 内核栈 / PageTables / Percpu\n")
+	fmt.Fprintf(&details, "   当前: %.2f/%.2f/%.2f MB\n", kbToMB(float64(latest.MemStats.KernelStack)), kbToMB(float64(latest.MemStats.PageTables)), kbToMB(float64(latest.MemStats.Percpu)))
+	fmt.Fprintf(&details, "   短窗增幅: %.1f/%.1f/%.1f MB\n", kernelDelta.kernelStackMB, kernelDelta.pageTablesMB, kernelDelta.percpuMB)
+	details.WriteString("   说明: KernelStack=线程/协程栈，PageTables=内存映射页表，Percpu=每CPU局部缓存\n")
+
+	details.WriteString("7) 大页信息（仅报告）\n")
+	fmt.Fprintf(&details, "   HugePages_Total: %d, HugePages_Free: %d, Hugepagesize: %d kB\n", latest.MemStats.HugePagesTotal, latest.MemStats.HugePagesFree, latest.MemStats.Hugepagesize)
 
 	// 打印详细异常列表
 	anomalyCategories := make(map[string][]common.TrendAnomaly)
@@ -460,8 +669,70 @@ func printMemInfoReport(log *meminfo.MemInfoLog, startTime, endTime time.Time, t
 	anomalyCategories["Slab"] = slabAnomalies
 	anomalyCategories["Swap"] = swapAnomalies
 
-	printAnomalyDetailList(anomalyCategories, timeLayout)
+	details.WriteString(formatAnomalyDetailList(anomalyCategories, timeLayout))
 
+	// Compatibility path: detailed text sections are retained here to preserve
+	// report-mode console ordering; export reports now use module analyzer data.
+	report, err := modulememinfo.BuildReport(&modulememinfo.Analysis{
+		Start:      startTime,
+		End:        endTime,
+		DataPoints: len(data),
+		Summary: []reportbase.SummaryItem{
+			{Name: "时间范围", Value: fmt.Sprintf("%s ~ %s", startTime.Format(timeLayout), endTime.Format(timeLayout))},
+			{Name: "主机", Value: extractHostnameIfPossible(data)},
+			{Name: "采样数量", Value: fmt.Sprintf("%d", len(data))},
+			{Name: "统计窗口", Value: fmt.Sprintf("短窗 %d 点, 长窗 %d 点", cfg.ShortWindowPoints, cfg.LongWindowPoints)},
+		},
+		Sections: []reportbase.Section{
+			{Title: "📈 系统指标摘要", Body: overview.String()},
+			{Title: "⚠️  告警与趋势", Body: trends.String()},
+			{Title: "📋 详细指标", Body: details.String()},
+		},
+		Findings: memFindings,
+	})
+	if err != nil || !printReportText(report) {
+		fmt.Println("生成 meminfo 报告失败")
+	}
+}
+
+func appendFindingBackedMemInfoAnomalies(anomalies []common.TrendAnomaly, items []findings.Finding, ruleID, layout string) []common.TrendAnomaly {
+	for _, item := range items {
+		if item.RuleID != ruleID {
+			continue
+		}
+		at, err := time.Parse(layout, item.Time)
+		if err != nil {
+			continue
+		}
+		anomalies = append(anomalies, common.TrendAnomaly{
+			Type:      "findings: " + item.Title,
+			Time:      at,
+			Value:     metricOrObserved(item, "anon_delta_mb"),
+			StartVal:  item.Metrics["anon_start_mb"],
+			EndVal:    item.Metrics["anon_peak_mb"],
+			Threshold: item.Threshold,
+			RuleName:  item.RuleID,
+		})
+	}
+	return anomalies
+}
+
+func hasFindingRule(items []findings.Finding, ruleID string) bool {
+	for _, item := range items {
+		if item.RuleID == ruleID {
+			return true
+		}
+	}
+	return false
+}
+
+func metricOrObserved(item findings.Finding, key string) float64 {
+	if item.Metrics != nil {
+		if value, ok := item.Metrics[key]; ok {
+			return value
+		}
+	}
+	return item.ObservedValue
 }
 
 // mergeMemInfoFiles 解析并合并多个 meminfo 文件
@@ -501,7 +772,7 @@ func printDeviceStats(device string, iostatLog *iostat.IOStatLog, startTime, end
 	}
 
 	// 获取性能统计
-	readMax, writeMax, readAvg, writeAvg := iostatLog.GetThroughputStats(device, startTime, endTime)
+	readMax, writeMax, discardMax, readAvg, writeAvg, discardAvg := iostatLog.GetThroughputStats(device, startTime, endTime)
 	avgQueueDepth := iostatLog.GetAverageQueueDepth(device, startTime, endTime)
 	readLatencyStats := iostatLog.GetReadLatencyStats(device, startTime, endTime)
 	writeLatencyStats := iostatLog.GetWriteLatencyStats(device, startTime, endTime)
@@ -509,15 +780,15 @@ func printDeviceStats(device string, iostatLog *iostat.IOStatLog, startTime, end
 	fmt.Printf("%s:\n", device)
 	fmt.Printf("  IOPS: 最大=%.1f (时间:%s) 平均=%.1f\n",
 		maxIops.Value, maxIops.Time.Format(TimeShortLayout), iops.Average())
-	fmt.Printf("  吞吐量(KB/s): 读最大=%.1f 写最大=%.1f 读平均=%.1f 写平均=%.1f\n",
-		readMax, writeMax, readAvg, writeAvg)
-	fmt.Printf("  延迟(μs): 读平均=%.1f 写平均=%.1f\n",
+	fmt.Printf("  吞吐量(KB/s): 读最大=%.1f 写最大=%.1f 丢弃最大=%.1f 读平均=%.1f 写平均=%.1f 丢弃平均=%.1f\n",
+		readMax, writeMax, discardMax, readAvg, writeAvg, discardAvg)
+	fmt.Printf("  延迟(ms): 读平均=%.1f 写平均=%.1f\n",
 		readLatencyStats.Mean, writeLatencyStats.Mean)
 	fmt.Printf("  平均队列深度: %.2f\n", avgQueueDepth)
 	fmt.Println()
 }
 
-// printAnomalyStats 输出延迟异常统计
+// printAnomalyStats 输出延迟突增统计
 func printAnomalyStats(device string, latencyStats iostat.LatencyStats, latencyType string) {
 	if len(latencyStats.Anomalies) == 0 {
 		return
@@ -525,16 +796,18 @@ func printAnomalyStats(device string, latencyStats iostat.LatencyStats, latencyT
 
 	maxAnomaly := findMaxAnomaly(latencyStats.Anomalies)
 	fmt.Printf("%s %s延迟:\n", device, latencyType)
-	fmt.Printf("  统计: μ=%.1fμs σ=%.1f MAD=%.1f P50=%.1f P95=%.1f P99=%.1f\n",
+	fmt.Printf("  统计: μ=%.1fms σ=%.1f MAD=%.1f P50=%.1f P95=%.1f P99=%.1f\n",
 		latencyStats.Mean, latencyStats.StdDev, latencyStats.MAD,
 		latencyStats.P50, latencyStats.P95, latencyStats.P99)
-	fmt.Printf("  异常: %d个突增点, 最严重=%.1fμs @ %s",
+	fmt.Printf("  突增: %d个候选点, 最高=%.1fms @ %s",
 		len(latencyStats.Anomalies), maxAnomaly.Value, maxAnomaly.Timestamp.Format(TimeLayout))
 
 	if maxAnomaly.Method == "z-score" {
 		fmt.Printf(" (%.1fσ)\n", maxAnomaly.ZScore)
 	} else if maxAnomaly.Method == "mad" {
 		fmt.Printf(" (MAD×%.0f)\n", maxAnomaly.MADScore)
+	} else if maxAnomaly.Method == "threshold" {
+		fmt.Printf(" (绝对阈值)\n")
 	} else {
 		fmt.Printf(" (IQR)\n")
 	}
@@ -822,7 +1095,7 @@ func stdDev(values []float64, mean float64) float64 {
 }
 
 // detectVPattern 检测 V 型波动 (跌落后回升)
-func detectVPattern(data []meminfo.MemStatData, extractor func(meminfo.MemStats) float64) []common.TrendAnomaly {
+func detectVPattern(data []meminfo.MemStatData, extractor func(meminfo.MemStats) float64, cfg config.MeminfoConfig) []common.TrendAnomaly {
 	var anomalies []common.TrendAnomaly
 	if len(data) < 5 {
 		return anomalies
@@ -843,7 +1116,7 @@ func detectVPattern(data []meminfo.MemStatData, extractor func(meminfo.MemStats)
 		drop := prevAvg - curr
 		recover := nextAvg - curr
 
-		if drop > memVPatternDropMB && recover > memVPatternRecoverMB {
+		if drop > cfg.VPatternDropMB && recover > cfg.VPatternRecoverMB {
 			anomalies = append(anomalies, common.TrendAnomaly{
 				Type:      "V型波动",
 				Time:      data[i].Timestamp,
@@ -851,7 +1124,7 @@ func detectVPattern(data []meminfo.MemStatData, extractor func(meminfo.MemStats)
 				IsSudden:  true,
 				StartVal:  prevAvg,
 				EndVal:    curr,
-				Threshold: memVPatternDropMB,
+				Threshold: cfg.VPatternDropMB,
 				RuleName:  "V型跌落回升",
 			})
 		}
@@ -867,6 +1140,11 @@ func detectVPattern(data []meminfo.MemStatData, extractor func(meminfo.MemStats)
 
 // findSignificantTrendChange 全局扫描寻找所有显著的趋势突变点
 func findSignificantTrendChange(data []meminfo.MemStatData, extractor func(meminfo.MemStats) float64, thresholdSlope float64, memTotalMB float64) []common.TrendAnomaly {
+	return findSignificantTrendChangeWithConfig(data, extractor, thresholdSlope, memTotalMB, config.Default().Meminfo)
+}
+
+func findSignificantTrendChangeWithConfig(data []meminfo.MemStatData, extractor func(meminfo.MemStats) float64, thresholdSlope float64, memTotalMB float64, cfg config.MeminfoConfig) []common.TrendAnomaly {
+	cfg = cfg.WithDefaults()
 	var anomalies []common.TrendAnomaly
 	if len(data) < 2 {
 		return anomalies
@@ -874,9 +1152,9 @@ func findSignificantTrendChange(data []meminfo.MemStatData, extractor func(memin
 
 	// 1. 动态计算突变阈值
 	// 规则: 取系统总内存的 2%，如果不足 2GB 则按 2GB 计算
-	suddenChangeThresholdMB := memTotalMB * (memSuddenChangePct / 100.0)
-	if suddenChangeThresholdMB < memSuddenChangeMinMB {
-		suddenChangeThresholdMB = memSuddenChangeMinMB
+	suddenChangeThresholdMB := memTotalMB * (cfg.SuddenChangePct / 100.0)
+	if suddenChangeThresholdMB < cfg.SuddenChangeMinMB {
+		suddenChangeThresholdMB = cfg.SuddenChangeMinMB
 	}
 
 	// 遍历数据进行检测
@@ -908,13 +1186,13 @@ func findSignificantTrendChange(data []meminfo.MemStatData, extractor func(memin
 		}
 
 		// 如果数据不够长窗口，跳过趋势计算
-		if i < memLongWindow {
+		if i < cfg.LongWindowPoints {
 			continue
 		}
 
 		// --- 检测 B: 趋势斜率变化 (针对缓慢泄漏) ---
-		longStartIdx := i - memLongWindow
-		shortStartIdx := i - memShortWindow
+		longStartIdx := i - cfg.LongWindowPoints
+		shortStartIdx := i - cfg.ShortWindowPoints
 		if shortStartIdx < 0 {
 			shortStartIdx = 0
 		}
@@ -923,8 +1201,8 @@ func findSignificantTrendChange(data []meminfo.MemStatData, extractor func(memin
 		valShortStart := extractor(data[shortStartIdx].MemStats)
 
 		// 计算斜率 (MB/采样点)
-		slopeLong := (valCurrent - valLongStart) / 1024.0 / float64(memLongWindow)
-		slopeShort := (valCurrent - valShortStart) / 1024.0 / float64(memShortWindow)
+		slopeLong := (valCurrent - valLongStart) / 1024.0 / float64(cfg.LongWindowPoints)
+		slopeShort := (valCurrent - valShortStart) / 1024.0 / float64(cfg.ShortWindowPoints)
 
 		diff := slopeShort - slopeLong
 		absDiff := math.Abs(diff)
@@ -954,6 +1232,43 @@ func findSignificantTrendChange(data []meminfo.MemStatData, extractor func(memin
 	})
 
 	return anomalies
+}
+
+func filterAvailablePressureAnomalies(anomalies []common.TrendAnomaly, data []meminfo.MemStatData, cfg config.MeminfoConfig) []common.TrendAnomaly {
+	filtered := anomalies[:0]
+	for _, anomaly := range anomalies {
+		if (strings.HasPrefix(anomaly.Type, "骤降") || anomaly.Type == "V型波动") && availableAnomalyHasPressure(anomaly, data, cfg) {
+			filtered = append(filtered, anomaly)
+		}
+	}
+	return filtered
+}
+
+func availableAnomalyHasPressure(anomaly common.TrendAnomaly, data []meminfo.MemStatData, cfg config.MeminfoConfig) bool {
+	checked := 0
+	for _, sample := range data {
+		if sample.Timestamp.Before(anomaly.Time) {
+			continue
+		}
+		checked++
+		if memSampleHasAvailablePressure(sample.MemStats, cfg) {
+			return true
+		}
+		if checked >= cfg.ShortWindowPoints {
+			break
+		}
+	}
+	return false
+}
+
+func memSampleHasAvailablePressure(stats meminfo.MemStats, cfg config.MeminfoConfig) bool {
+	if stats.MemTotal <= 0 {
+		return false
+	}
+	availKB := float64(meminfo.EffectiveMemAvailableKB(stats))
+	availPct := pct(availKB, float64(stats.MemTotal))
+	availMB := kbToMB(availKB)
+	return classifyAvail(availPct, availMB, cfg) != "正常"
 }
 
 // deltaMB 计算窗口首尾差值 (MB)
@@ -986,38 +1301,38 @@ func swapDeltaPct(win []meminfo.MemStatData, swapTotal int64) float64 {
 }
 
 // classifyAvail 按可用内存占比和绝对值判定
-func classifyAvail(availPct, availMB float64) string {
-	if availMB < memAvailSevereMB || availPct < memAvailSeverePct {
+func classifyAvail(availPct, availMB float64, cfg config.MeminfoConfig) string {
+	if availMB < cfg.AvailableSevereMB || availPct < cfg.AvailableSeverePct {
 		return "严重"
 	}
-	if availMB < memAvailWarnMB || availPct < memAvailWarnPct {
+	if availMB < cfg.AvailableWarnMB || availPct < cfg.AvailableWarnPct {
 		return "警告"
 	}
 	return "正常"
 }
 
 // classifySlab 判定 Slab 状态
-func classifySlab(slabMB, slabPct float64) string {
-	if slabMB > memSlabWarnMB && slabPct > memSlabWarnPct {
+func classifySlab(slabMB, slabPct float64, cfg config.MeminfoConfig) string {
+	if slabMB > cfg.SlabWarnMB && slabPct > cfg.SlabWarnPct {
 		return "警告 (高占用)"
 	}
 	return "正常"
 }
 
 // classifyAnon 判定匿名页趋势
-func classifyAnon(deltaMB, rateMB, availSlope float64) string {
-	if deltaMB > memAnonLeakDeltaMB && rateMB > memAnonLeakRateMBPerSample {
+func classifyAnon(deltaMB, rateMB, availSlope float64, cfg config.MeminfoConfig) string {
+	if deltaMB > cfg.AnonLeakDeltaMB && rateMB > cfg.AnonLeakHardRateMBPerSample {
 		return "疑似泄漏"
 	}
-	if deltaMB > memAnonLeakDeltaMB && availSlope < 0 {
+	if deltaMB > cfg.AnonLeakDeltaMB && availSlope < 0 {
 		return "疑似泄漏"
 	}
 	return "正常"
 }
 
 // classifyUnreclaim 判定不可回收 Slab 状态
-func classifyUnreclaim(unreclaimPct, slope float64) string {
-	if unreclaimPct > memUnreclaimPctThresh {
+func classifyUnreclaim(unreclaimPct, slope float64, cfg config.MeminfoConfig) string {
+	if unreclaimPct > cfg.UnreclaimWarnPct {
 		return "告警"
 	}
 	if slope > 0 {
@@ -1027,12 +1342,12 @@ func classifyUnreclaim(unreclaimPct, slope float64) string {
 }
 
 // classifySwapUsage 判定 Swap 状态
-func classifySwapUsage(swapFree, swapTotal int64, swapPct, availPct float64) string {
+func classifySwapUsage(swapFree, swapTotal int64, swapPct, availPct float64, cfg config.MeminfoConfig) string {
 	if swapTotal == 0 {
 		return "无 Swap"
 	}
 	if swapFree < swapTotal {
-		if swapPct < memSwapSeverePct && availPct < memAvailSeverePct {
+		if swapPct < cfg.SwapSeverePct && availPct < cfg.AvailableSeverePct {
 			return "严重"
 		}
 		return "已使用 Swap"
@@ -1040,8 +1355,21 @@ func classifySwapUsage(swapFree, swapTotal int64, swapPct, availPct float64) str
 	return "未使用"
 }
 
+func classifyCommitUsage(commitPct float64, commitLimit int64, cfg config.MeminfoConfig) string {
+	if commitLimit == 0 {
+		return "未知"
+	}
+	if commitPct >= cfg.CommitHardPct {
+		return "严重"
+	}
+	if commitPct >= cfg.CommitWarnPct {
+		return "警告"
+	}
+	return "正常"
+}
+
 // classifyKernelOverhead 检测内核开销突增
-func classifyKernelOverhead(win []meminfo.MemStatData) (string, kernelDelta) {
+func classifyKernelOverhead(win []meminfo.MemStatData, cfg config.MeminfoConfig) (string, kernelDelta) {
 	if len(win) < 2 {
 		return "正常", kernelDelta{}
 	}
@@ -1054,14 +1382,14 @@ func classifyKernelOverhead(win []meminfo.MemStatData) (string, kernelDelta) {
 	}
 
 	status := "正常"
-	if exceedsKernel(delta.kernelStackMB, first.KernelStack) || exceedsKernel(delta.pageTablesMB, first.PageTables) || exceedsKernel(delta.percpuMB, first.Percpu) {
+	if exceedsKernel(delta.kernelStackMB, first.KernelStack, cfg) || exceedsKernel(delta.pageTablesMB, first.PageTables, cfg) || exceedsKernel(delta.percpuMB, first.Percpu, cfg) {
 		status = "线程/映射异常"
 	}
 	return status, delta
 }
 
-func exceedsKernel(deltaMB float64, baseKB int64) bool {
-	if math.Abs(deltaMB) > memKernelAbsWarnMB {
+func exceedsKernel(deltaMB float64, baseKB int64, cfg config.MeminfoConfig) bool {
+	if math.Abs(deltaMB) > cfg.KernelAbsWarnMB {
 		return true
 	}
 	if baseKB == 0 {
@@ -1071,7 +1399,7 @@ func exceedsKernel(deltaMB float64, baseKB int64) bool {
 	if baseMB == 0 {
 		return false
 	}
-	return (deltaMB/baseMB)*100 > memKernelDeltaPctWarn
+	return (deltaMB/baseMB)*100 > cfg.KernelDeltaPctWarn
 }
 
 // pct 计算百分比
@@ -1165,7 +1493,12 @@ func formatAnomalies(anomalies []common.TrendAnomaly, layout string) string {
 
 // printAnomalyDetailList 打印详细异常列表
 func printAnomalyDetailList(categories map[string][]common.TrendAnomaly, layout string) {
-	fmt.Println("[异常点列表]")
+	fmt.Print(formatAnomalyDetailList(categories, layout))
+}
+
+func formatAnomalyDetailList(categories map[string][]common.TrendAnomaly, layout string) string {
+	var sb strings.Builder
+	sb.WriteString("[异常点列表]\n")
 
 	// 按固定顺���输出
 	keys := []string{"可用内存 (Available)", "匿名页 (AnonPages)", "Slab", "Swap"}
@@ -1174,34 +1507,34 @@ func printAnomalyDetailList(categories map[string][]common.TrendAnomaly, layout 
 	for _, key := range keys {
 		anomalies, exists := categories[key]
 		if !exists || len(anomalies) == 0 {
-			fmt.Printf("\n%d. %s\n   - 无异常\n", index, key)
+			fmt.Fprintf(&sb, "\n%d. %s\n   - 无异常\n", index, key)
 			index++
 			continue
 		}
 
-		fmt.Printf("\n%d. %s\n", index, key)
+		fmt.Fprintf(&sb, "\n%d. %s\n", index, key)
 
 		// 限制显示数量，防止刷屏 (例如前 10 个)
 		limit := 10
 		if len(anomalies) > limit {
-			fmt.Printf("   (共 %d 个异常，仅显示前 %d 个最严重的)\n", len(anomalies), limit)
+			fmt.Fprintf(&sb, "   (共 %d 个异常，仅显示前 %d 个最严重的)\n", len(anomalies), limit)
 			anomalies = anomalies[:limit]
 		}
 
 		for _, a := range anomalies {
-			fmt.Printf("   - 时间: %s\n", a.Time.Format(layout))
-			fmt.Printf("     类型: %s\n", a.Type)
+			fmt.Fprintf(&sb, "   - 时间: %s\n", a.Time.Format(layout))
+			fmt.Fprintf(&sb, "     类型: %s\n", a.Type)
 
 			// 根据类型格式化详情
 			if a.Type == "V型波动" {
-				fmt.Printf("     详情: 跌落 %.2f GB (%.2f -> %.2f GB)\n", a.Value, kbToGB(a.StartVal*1024), kbToGB(a.EndVal*1024))
+				fmt.Fprintf(&sb, "     详情: 跌落 %.2f GB (%.2f -> %.2f GB)\n", a.Value, kbToGB(a.StartVal*1024), kbToGB(a.EndVal*1024))
 			} else if a.RuleName == "趋势斜率差异" {
-				fmt.Printf("     详情: 斜率变化 %.2f MB/点 (长期 %.2f -> 短期 %.2f)\n", a.Value, a.StartVal, a.EndVal)
+				fmt.Fprintf(&sb, "     详情: 斜率变化 %.2f MB/点 (长期 %.2f -> 短期 %.2f)\n", a.Value, a.StartVal, a.EndVal)
 			} else {
-				fmt.Printf("     详情: %.2f -> %.2f GB (变化量: %.2f GB)\n", kbToGB(a.StartVal*1024), kbToGB(a.EndVal*1024), a.Value/1024.0) // a.Value 是 MB
+				fmt.Fprintf(&sb, "     详情: %.2f -> %.2f GB (变化量: %.2f GB)\n", kbToGB(a.StartVal*1024), kbToGB(a.EndVal*1024), a.Value/1024.0) // a.Value 是 MB
 			}
 
-			fmt.Printf("     规则: 命中\"%s\"\n", a.RuleName)
+			fmt.Fprintf(&sb, "     规则: 命中\"%s\"\n", a.RuleName)
 
 			// 格式化阈值显示
 			threshStr := ""
@@ -1210,10 +1543,10 @@ func printAnomalyDetailList(categories map[string][]common.TrendAnomaly, layout 
 			} else {
 				threshStr = fmt.Sprintf("%.2f GB", a.Threshold/1024.0) // Threshold 是 MB
 			}
-			fmt.Printf("     阈值: %s\n", threshStr)
-			fmt.Println()
+			fmt.Fprintf(&sb, "     阈值: %s\n\n", threshStr)
 		}
 		index++
 	}
-	fmt.Println()
+	sb.WriteString("\n")
+	return sb.String()
 }

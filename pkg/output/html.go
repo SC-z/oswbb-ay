@@ -4,6 +4,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"oswbb-analyse/pkg/diagnosis"
+	"oswbb-analyse/pkg/findings"
+	"strings"
 	"text/template"
 )
 
@@ -11,60 +14,93 @@ import (
 type HTMLFormatter struct{}
 
 // NewHTMLFormatter 创建HTML输出器
+//
+// Deprecated: new code should use internal/output.HTMLFormatter. This legacy
+// dashboard formatter remains for compatibility callers.
 func NewHTMLFormatter() *HTMLFormatter {
 	return &HTMLFormatter{}
 }
 
 // htmlData 用于传递给模板的数据结构
 type htmlData struct {
+	Title        string
+	DataType     string // "iostat" or "meminfo"
+	Data         string // JSON string
+	Findings     []htmlFindingSummary
+	ShowFindings bool
+	ShowAI       bool
+	AIDiagnosis  diagnosis.AIResult
+}
+
+type htmlFindingSummary struct {
+	Severity string
+	Nature   string
 	Title    string
-	DataType string // "iostat" or "meminfo"
-	Data     string // JSON string
+	Meta     string
+	Summary  string
 }
 
 // OutputIOStatData 输出iostat数据为HTML格式
-func (f *HTMLFormatter) OutputIOStatData(data []IOStatRawMetrics, filename string) error {
-	jsonData, err := json.Marshal(data)
+//
+// Deprecated: new code should format internal/report.Report via internal/output.
+func (f *HTMLFormatter) OutputIOStatData(export IOStatExport, filename string) error {
+	jsonData, err := json.Marshal(export.Data)
 	if err != nil {
 		return fmt.Errorf("JSON序列化失败: %v", err)
 	}
 
 	tmplData := htmlData{
-		Title:    "OSWbb IOStat 分析报告",
-		DataType: "iostat",
-		Data:     string(jsonData),
+		Title:        "OSWbb IOStat 分析报告",
+		DataType:     "iostat",
+		Data:         string(jsonData),
+		Findings:     buildHTMLFindingSummaries(export.Findings),
+		ShowFindings: len(export.Findings) > 0,
+		ShowAI:       export.AIDiagnosis.Enabled,
+		AIDiagnosis:  export.AIDiagnosis,
 	}
 
 	return f.writeHTML(filename, tmplData)
 }
 
 // OutputMemInfoData 输出meminfo数据为HTML格式
-func (f *HTMLFormatter) OutputMemInfoData(data []MemInfoRawMetrics, filename string) error {
-	jsonData, err := json.Marshal(data)
+//
+// Deprecated: new code should format internal/report.Report via internal/output.
+func (f *HTMLFormatter) OutputMemInfoData(export MemInfoExport, filename string) error {
+	jsonData, err := json.Marshal(export.Data)
 	if err != nil {
 		return fmt.Errorf("JSON序列化失败: %v", err)
 	}
 
 	tmplData := htmlData{
-		Title:    "OSWbb MemInfo 分析报告",
-		DataType: "meminfo",
-		Data:     string(jsonData),
+		Title:        "OSWbb MemInfo 分析报告",
+		DataType:     "meminfo",
+		Data:         string(jsonData),
+		Findings:     buildHTMLFindingSummaries(export.Findings),
+		ShowFindings: len(export.Findings) > 0,
+		ShowAI:       export.AIDiagnosis.Enabled,
+		AIDiagnosis:  export.AIDiagnosis,
 	}
 
 	return f.writeHTML(filename, tmplData)
 }
 
 // OutputTopData 输出top数据为HTML格式
-func (f *HTMLFormatter) OutputTopData(data []TopRawMetrics, filename string) error {
-	jsonData, err := json.Marshal(data)
+//
+// Deprecated: new code should format internal/report.Report via internal/output.
+func (f *HTMLFormatter) OutputTopData(export TopExport, filename string) error {
+	jsonData, err := json.Marshal(export.Data)
 	if err != nil {
 		return fmt.Errorf("JSON序列化失败: %v", err)
 	}
 
 	tmplData := htmlData{
-		Title:    "OSWbb Top 分析报告",
-		DataType: "top",
-		Data:     string(jsonData),
+		Title:        "OSWbb Top 分析报告",
+		DataType:     "top",
+		Data:         string(jsonData),
+		Findings:     buildHTMLFindingSummaries(export.Findings),
+		ShowFindings: len(export.Findings) > 0,
+		ShowAI:       export.AIDiagnosis.Enabled,
+		AIDiagnosis:  export.AIDiagnosis,
 	}
 
 	return f.writeHTML(filename, tmplData)
@@ -90,6 +126,66 @@ func (f *HTMLFormatter) writeHTML(filename string, data htmlData) error {
 	return nil
 }
 
+func buildHTMLFindingSummaries(items []findings.Finding) []htmlFindingSummary {
+	summaries := make([]htmlFindingSummary, 0, len(items))
+	for _, item := range items {
+		summaries = append(summaries, htmlFindingSummary{
+			Severity: htmlFindingSeverityLabel(item.Severity),
+			Nature:   htmlFindingNatureLabel(item),
+			Title:    item.Title,
+			Meta:     htmlFindingMeta(item),
+			Summary:  item.Summary,
+		})
+	}
+	return summaries
+}
+
+func htmlFindingSeverityLabel(severity findings.Severity) string {
+	switch severity {
+	case findings.SeverityHigh:
+		return "高"
+	case findings.SeverityMedium:
+		return "中"
+	case findings.SeverityLow:
+		return "低"
+	default:
+		return "信息"
+	}
+}
+
+func htmlFindingNatureLabel(item findings.Finding) string {
+	nature := item.Nature
+	if nature == "" {
+		nature = findings.InferFindingNature(item)
+	}
+	if nature == findings.FindingNatureCandidate {
+		return "候选线索"
+	}
+	return "风险信号"
+}
+
+func htmlFindingMeta(item findings.Finding) string {
+	parts := []string{"来源=" + item.Source}
+	if item.Target != "" {
+		parts = append(parts, "对象="+item.Target)
+	}
+	if item.Time != "" {
+		parts = append(parts, "时间="+item.Time)
+	} else if item.WindowStart != "" || item.WindowEnd != "" {
+		parts = append(parts, "时间窗口="+item.WindowStart+"~"+item.WindowEnd)
+	}
+	if item.Metric != "" {
+		parts = append(parts, "指标="+item.Metric)
+	}
+	if item.ObservedValue != 0 {
+		parts = append(parts, fmt.Sprintf("观测=%.2f", item.ObservedValue))
+	}
+	if item.Threshold != 0 {
+		parts = append(parts, fmt.Sprintf("阈值=%.2f", item.Threshold))
+	}
+	return strings.Join(parts, " ")
+}
+
 const htmlTemplate = `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -102,6 +198,27 @@ const htmlTemplate = `<!DOCTYPE html>
         .header { background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); margin-bottom: 20px; position: sticky; top: 0; z-index: 1000; }
         .title { margin: 0 0 15px 0; font-size: 24px; color: #333; }
         .controls { display: flex; gap: 20px; align-items: center; flex-wrap: wrap; }
+        .ai-summary { margin-top: 16px; padding: 16px 18px; border-radius: 10px; background: linear-gradient(135deg, #f5fbff, #eef7ff); border: 1px solid #d6e8fb; }
+        .ai-summary.fallback { background: linear-gradient(135deg, #fff8ed, #fff2d8); border-color: #f0c77a; }
+        .ai-summary h2 { margin: 0 0 10px 0; font-size: 18px; color: #214c74; }
+        .ai-summary.fallback h2 { color: #8a5a09; }
+        .ai-summary p { margin: 8px 0; color: #334155; line-height: 1.5; }
+        .diagnosis-panel { margin-bottom: 20px; }
+        .findings-summary { padding: 14px 18px; border-radius: 10px; background: #fbfcfe; border: 1px solid #dbe4ee; }
+        .findings-summary summary { cursor: pointer; font-size: 18px; font-weight: 600; color: #26364a; list-style: none; }
+        .findings-summary summary::-webkit-details-marker { display: none; }
+        .findings-summary summary::after { content: "展开"; float: right; font-size: 13px; font-weight: 500; color: #5b6472; }
+        .findings-summary[open] summary::after { content: "收起"; }
+        .finding-list { margin: 12px 0 0; padding-left: 18px; }
+        .finding-list li { margin-bottom: 12px; color: #243142; }
+        .finding-badges { display: inline-flex; gap: 6px; margin-right: 6px; vertical-align: middle; }
+        .finding-badge { display: inline-block; padding: 2px 7px; border-radius: 999px; font-size: 12px; line-height: 1.4; background: #e9eef5; color: #28384c; }
+        .finding-meta { margin-top: 4px; font-size: 13px; color: #5b6472; }
+        .finding-summary { margin-top: 4px; color: #334155; line-height: 1.5; }
+        .incident-list { margin: 12px 0 0 0; padding-left: 18px; }
+        .incident-list li { margin-bottom: 10px; color: #243b53; }
+        .incident-meta { font-size: 13px; color: #5b7085; }
+        .incident-checks { margin-top: 4px; font-size: 13px; color: #475569; }
         .chart-container { background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); margin-bottom: 20px; height: 400px; }
         .checkbox-group { display: flex; gap: 10px; flex-wrap: wrap; max-height: 100px; overflow-y: auto; padding: 5px; border: 1px solid #eee; border-radius: 4px; }
         .checkbox-item { display: flex; align-items: center; gap: 4px; font-size: 14px; cursor: pointer; user-select: none; background: #f0f0f0; padding: 2px 8px; border-radius: 12px; }
@@ -119,7 +236,53 @@ const htmlTemplate = `<!DOCTYPE html>
         <div id="controls" class="controls">
             <!-- 动态生成的控件区域 -->
         </div>
+        {{if .ShowAI}}
+        <div class="ai-summary {{if eq .AIDiagnosis.Status "fallback"}}fallback{{end}}">
+            <h2>AI 辅助诊断</h2>
+            {{if eq .AIDiagnosis.Status "fallback"}}
+            <p>AI 诊断未生效，已回退到规则分析：{{.AIDiagnosis.FallbackReason}}</p>
+            {{else}}
+            <p>{{.AIDiagnosis.Summary}}</p>
+            {{if .AIDiagnosis.Incidents}}
+            <ul class="incident-list">
+                {{range .AIDiagnosis.Incidents}}
+                <li>
+                    <strong>{{.Classification}}</strong>
+                    <span class="incident-meta">Severity={{.Severity}} | Confidence={{printf "%.2f" .Confidence}}</span>
+                    <div class="incident-checks">建议核查:
+                        {{range $index, $item := .NextChecks}}{{if $index}}；{{end}}{{$item}}{{end}}
+                    </div>
+                </li>
+                {{end}}
+            </ul>
+            {{else}}
+            <p>模型本次未补充出新的高置信 incident。</p>
+            {{end}}
+            {{end}}
+        </div>
+        {{end}}
     </div>
+    {{if .ShowFindings}}
+    <section class="diagnosis-panel">
+        <!-- 规则摘要必须脱离 sticky header；展开时通过文档流下推图表，避免遮挡监控图。 -->
+        <details class="findings-summary">
+            <summary>规则诊断摘要</summary>
+            <ul class="finding-list">
+                {{range .Findings}}
+                <li>
+                    <span class="finding-badges">
+                        <span class="finding-badge">{{.Severity}}</span>
+                        <span class="finding-badge">{{.Nature}}</span>
+                    </span>
+                    <strong>{{.Title}}</strong>
+                    <div class="finding-meta">{{.Meta}}</div>
+                    {{if .Summary}}<div class="finding-summary">{{.Summary}}</div>{{end}}
+                </li>
+                {{end}}
+            </ul>
+        </details>
+    </section>
+    {{end}}
     <div id="main-container">
         <div class="loading">正在处理数据并渲染图表...</div>
     </div>
@@ -176,6 +339,7 @@ const htmlTemplate = `<!DOCTYPE html>
                 { key: 'read_await', name: '读延迟 (ms)' },
                 { key: 'write_await', name: '写延迟 (ms)' },
                 { key: 'avg_queue_size', name: '平均队列深度 (avgqu-sz)' },
+                { key: 'utilization', name: '设备利用率 (%)' },
                 { key: 'avg_req_size', name: '平均请求大小 (avgrq-sz)' },
                 { key: 'read_merge_per_sec', name: '读合并/秒 (rrqm/s)' },
                 { key: 'write_merge_per_sec', name: '写合并/秒 (wrqm/s)' }

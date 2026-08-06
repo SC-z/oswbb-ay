@@ -4,9 +4,13 @@ import (
 	"bufio"
 	"fmt"
 	"os"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
+
+var compactCPUFieldRe = regexp.MustCompile(`([0-9]+(?:\.[0-9]+)?)%([a-zA-Z]+)`)
 
 // TopParser 解析器
 type TopParser struct{}
@@ -30,16 +34,14 @@ func (p *TopParser) ParseFile(filename string) (*TopLog, error) {
 
 	scanner := bufio.NewScanner(file)
 	var currentSnapshot *TopSnapshot
+	currentHasCPU := false
+	inProcessTable := false
 
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 
 		if strings.HasPrefix(line, "zzz ***") {
-			// 如果当前有快照数据，保存它
-			// 注意：这里我们假设只要有时间戳，就是一个新快照的开始
-			// 如果前一个快照完全没解析到数据（比如只有时间戳），保留它还是丢弃？
-			// 鉴于OSWatcher的特性，建议保留，但目前结构体默认值都是0
-			if currentSnapshot != nil {
+			if currentSnapshot != nil && currentHasCPU {
 				log.Snapshots = append(log.Snapshots, *currentSnapshot)
 			}
 
@@ -55,6 +57,8 @@ func (p *TopParser) ParseFile(filename string) (*TopLog, error) {
 			currentSnapshot = &TopSnapshot{
 				Timestamp: timestamp,
 			}
+			currentHasCPU = false
+			inProcessTable = false
 			continue
 		}
 
@@ -67,6 +71,7 @@ func (p *TopParser) ParseFile(filename string) (*TopLog, error) {
 		// 格式: top - 09:00:09 up 927 days, 20:58,  0 users,  load average: 24.01, 25.49, 25.36
 		if strings.Contains(line, "load average:") {
 			p.parseLoadAverage(line, currentSnapshot)
+			inProcessTable = false
 			continue
 		}
 
@@ -74,19 +79,31 @@ func (p *TopParser) ParseFile(filename string) (*TopLog, error) {
 		// 格式: Tasks: 3277 total,  30 running, 3247 sleeping,   0 stopped,   0 zombie
 		if strings.HasPrefix(line, "Tasks:") {
 			p.parseTasks(line, currentSnapshot)
+			inProcessTable = false
 			continue
 		}
 
 		// 解析 CPU
 		// 格式: %Cpu(s): 16.5 us,  2.7 sy,  0.0 ni, 80.1 id,  0.2 wa,  0.0 hi,  0.6 si,  0.0 st
 		if strings.HasPrefix(line, "%Cpu(s):") || strings.HasPrefix(line, "Cpu(s):") {
-			p.parseCpu(line, currentSnapshot)
+			currentHasCPU = p.parseCpu(line, currentSnapshot)
+			inProcessTable = false
 			continue
+		}
+
+		if isTopProcessHeader(line) {
+			inProcessTable = true
+			continue
+		}
+		if inProcessTable {
+			if process, ok := parseTopProcessLine(line); ok {
+				currentSnapshot.Processes = append(currentSnapshot.Processes, process)
+			}
 		}
 	}
 
 	// 添加最后一个快照
-	if currentSnapshot != nil {
+	if currentSnapshot != nil && currentHasCPU {
 		log.Snapshots = append(log.Snapshots, *currentSnapshot)
 	}
 
@@ -99,11 +116,11 @@ func (p *TopParser) parseTimestamp(line string) (time.Time, error) {
 	// 移除 "zzz ***" 前缀
 	// 注意：有些版本可能是 "zzz ***Wed" (紧凑) 或 "zzz *** Wed" (有空格)
 	// 简单策略：找到第一个 "*" 后的内容，或者按空格分割
-	
+
 	parts := strings.Fields(line)
 	// parts 可能是 ["zzz", "***Wed", "Dec", "17", "09:00:02", "CST", "2025"]
 	// 或者是 ["zzz", "***", "Wed", "Dec", "17", ...]
-	
+
 	if len(parts) < 6 {
 		return time.Time{}, fmt.Errorf("invalid timestamp line")
 	}
@@ -114,12 +131,12 @@ func (p *TopParser) parseTimestamp(line string) (time.Time, error) {
 		timeParts := parts[len(parts)-5:]
 		timeStr := strings.Join(timeParts, " ")
 		layout := "Jan 2 15:04:05 MST 2006"
-		
+
 		parsedTime, err := time.Parse(layout, timeStr)
 		if err != nil {
 			return time.Time{}, err
 		}
-		
+
 		// 转换为CST时区 (OSWatcher通常记录本地时间，这里强制指定CST以保持一致性)
 		cst := time.FixedZone("CST", 8*3600)
 		return parsedTime.In(cst), nil
@@ -134,12 +151,12 @@ func (p *TopParser) parseLoadAverage(line string, snap *TopSnapshot) {
 	if idx == -1 {
 		return
 	}
-	
+
 	loadStr := line[idx+len("load average:"):]
 	// 24.01, 25.49, 25.36
 	loadStr = strings.TrimSpace(loadStr)
 	parts := strings.Split(loadStr, ",")
-	
+
 	if len(parts) >= 3 {
 		fmt.Sscanf(parts[0], "%f", &snap.Load1)
 		fmt.Sscanf(parts[1], "%f", &snap.Load5)
@@ -153,17 +170,17 @@ func (p *TopParser) parseTasks(line string, snap *TopSnapshot) {
 	// 移除 "Tasks:"
 	content := strings.TrimPrefix(line, "Tasks:")
 	content = strings.TrimSpace(content)
-	
+
 	// 使用 Sscanf 直接匹配
 	// 注意：格式必须严格匹配，包括逗号
 	// 为了兼容性，先替换逗号为空格，再 Scan
 	cleanLine := strings.ReplaceAll(content, ",", "")
-	
+
 	var total, running, sleeping, stopped, zombie int
 	// 尝试匹配标准格式
-	_, err := fmt.Sscanf(cleanLine, "%d total %d running %d sleeping %d stopped %d zombie", 
+	_, err := fmt.Sscanf(cleanLine, "%d total %d running %d sleeping %d stopped %d zombie",
 		&total, &running, &sleeping, &stopped, &zombie)
-		
+
 	if err == nil {
 		snap.TaskTotal = total
 		snap.TaskRunning = running
@@ -174,45 +191,133 @@ func (p *TopParser) parseTasks(line string, snap *TopSnapshot) {
 }
 
 // parseCpu 解析CPU使用率
-func (p *TopParser) parseCpu(line string, snap *TopSnapshot) {
+func (p *TopParser) parseCpu(line string, snap *TopSnapshot) bool {
 	// %Cpu(s): 16.5 us,  2.7 sy,  0.0 ni, 80.1 id,  0.2 wa,  0.0 hi,  0.6 si,  0.0 st
 	// 移除前缀
 	idx := strings.Index(line, ":")
 	if idx == -1 {
-		return
+		return false
 	}
 	content := line[idx+1:]
-	
+
+	content = compactCPUFieldRe.ReplaceAllString(content, "$1 $2")
 	// 同样，移除逗号以便处理
 	cleanLine := strings.ReplaceAll(content, ",", "")
-	
+
 	// fmt.Sscanf 需要格式完全匹配，但这里每个字段都有后缀
 	// 我们可以循环读取
 	parts := strings.Fields(cleanLine)
+	parsed := false
 	for i := 0; i < len(parts)-1; i += 2 {
 		valStr := parts[i]
 		key := parts[i+1]
-		
+
 		var val float64
-		fmt.Sscanf(valStr, "%f", &val)
-		
+		if _, err := fmt.Sscanf(valStr, "%f", &val); err != nil {
+			continue
+		}
+
 		switch key {
 		case "us":
 			snap.CpuUser = val
+			parsed = true
 		case "sy":
 			snap.CpuSys = val
+			parsed = true
 		case "ni":
 			snap.CpuNice = val
+			parsed = true
 		case "id":
 			snap.CpuIdle = val
+			parsed = true
 		case "wa":
 			snap.CpuWait = val
+			parsed = true
 		case "hi":
 			snap.CpuHi = val
+			parsed = true
 		case "si":
 			snap.CpuSi = val
+			parsed = true
 		case "st":
 			snap.CpuSteal = val
+			parsed = true
 		}
 	}
+	return parsed
+}
+
+func isTopProcessHeader(line string) bool {
+	fields := strings.Fields(line)
+	return len(fields) >= 12 && fields[0] == "PID" && fields[1] == "USER"
+}
+
+func parseTopProcessLine(line string) (ProcessStats, bool) {
+	fields := strings.Fields(line)
+	if len(fields) < 12 {
+		return ProcessStats{}, false
+	}
+
+	pid, err := strconv.Atoi(fields[0])
+	if err != nil {
+		return ProcessStats{}, false
+	}
+	cpuPct, err := strconv.ParseFloat(fields[8], 64)
+	if err != nil {
+		return ProcessStats{}, false
+	}
+	memPct, err := strconv.ParseFloat(fields[9], 64)
+	if err != nil {
+		return ProcessStats{}, false
+	}
+
+	virtKB, ok := parseTopMemoryKB(fields[4])
+	if !ok {
+		return ProcessStats{}, false
+	}
+	resKB, ok := parseTopMemoryKB(fields[5])
+	if !ok {
+		return ProcessStats{}, false
+	}
+	shrKB, ok := parseTopMemoryKB(fields[6])
+	if !ok {
+		return ProcessStats{}, false
+	}
+
+	return ProcessStats{
+		PID:        pid,
+		User:       fields[1],
+		State:      fields[7],
+		CPUPercent: cpuPct,
+		MemPercent: memPct,
+		VirtKB:     virtKB,
+		ResKB:      resKB,
+		ShrKB:      shrKB,
+		Command:    strings.Join(fields[11:], " "),
+	}, true
+}
+
+func parseTopMemoryKB(value string) (int64, bool) {
+	if value == "" {
+		return 0, false
+	}
+	multiplier := float64(1)
+	number := value
+	suffix := strings.ToLower(value[len(value)-1:])
+	switch suffix {
+	case "g":
+		multiplier = 1024 * 1024
+		number = value[:len(value)-1]
+	case "m":
+		multiplier = 1024
+		number = value[:len(value)-1]
+	case "k":
+		number = value[:len(value)-1]
+	}
+
+	parsed, err := strconv.ParseFloat(number, 64)
+	if err != nil {
+		return 0, false
+	}
+	return int64(parsed * multiplier), true
 }

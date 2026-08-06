@@ -18,6 +18,27 @@ test.py
 *.dat
 *.gz
 
+# Local AI models
+/Qwen/
+/models/
+*.gguf
+*.safetensors
+
+# Local AI runtime binaries
+/runtime/
+
+# Non-engineering local payloads live here: samples, vendor bundles, models,
+# runtimes, generated binaries, and tool-specific local environments.
+other/*
+!other/README.md
+
+# Local code intelligence index
+.codegraph/
+
+# Local Codex work settings and skills
+/.codex/
+
 .DS_Store
 .python-version
-oswbb-analyse
+/oswbb-analyse
+/oswbb-analyse-ai

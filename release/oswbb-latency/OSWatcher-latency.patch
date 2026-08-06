@@ -1,0 +1,67 @@
+--- a/OSWatcher.sh
++++ b/OSWatcher.sh
+@@ -114,0 +115 @@
++latencystatus=0
+@@ -431,0 +433 @@
++    mkdir -p $OSWBB_ARCHIVE_DEST/oswlatency
+@@ -461,0 +464,3 @@
++if [ -f locks/latencylock.file ]; then
++  rm locks/latencylock.file
++fi
+@@ -605,0 +611,15 @@
++  Linux)
++    if command -v ping > /dev/null 2>&1; then
++      echo "PING found on your system."
++      PINGFOUND=1
++    else
++      echo "Warning... PING not found on your system. No latency data will be collected."
++      PINGFOUND=0
++    fi
++  ;;
++  *)
++    PINGFOUND=0
++  ;;
++esac
++
++case $PLATFORM in
+@@ -1052,0 +1073,13 @@
++
++######################################################################
++# LATENCY
++######################################################################
++if [ $PINGFOUND = 1 ]; then
++  if [ $hour != $lasthour ]; then
++    echo $PLATFORM OSWbb $version $hostn >> $OSWBB_ARCHIVE_DEST/oswlatency/${hostn}_latency_$hour
++    if [ $zipfiles = 1 ]; then
++      if [ -f $OSWBB_ARCHIVE_DEST/oswlatency/${hostn}_latency_$lasthour ]; then
++        $zip $OSWBB_ARCHIVE_DEST/oswlatency/${hostn}_latency_$lasthour &
++      fi
++    fi
++  fi
+@@ -1053,0 +1087,12 @@
++  if [ -f locks/latencylock.file ]; then
++    latencystatus=1
++  else
++    touch locks/latencylock.file
++    if [ $latencystatus = 1 ]; then
++      echo "***Warning. LATENCY response is spanning snapshot intervals."
++      latencystatus=0
++    fi
++    ./latencysub.sh $OSWBB_ARCHIVE_DEST/oswlatency/${hostn}_latency_$hour &
++  fi
++fi
++
+--- a/OSWatcherFM.sh
++++ b/OSWatcherFM.sh
+@@ -92,0 +93,11 @@
++# LATENCY
++######################################################################
++if [ -d $2/oswlatency ]; then
++  numberOfFiles=`ls -t $2/oswlatency | wc -l`
++  numberToDelete=`expr $numberOfFiles - $archiveInterval`
++  if [ $numberOfFiles -gt $archiveInterval ]
++    then
++      ls -t $2/oswlatency/* | tail -$numberToDelete | xargs rm
++  fi
++fi
++######################################################################

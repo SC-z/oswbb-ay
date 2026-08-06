@@ -1,0 +1,4 @@
+interface:
+  display_name: "OSWbb Operations"
+  short_description: "分析 OSWbb 日志、定位 Linux 性能问题并规范控制和扩展采集项"
+  default_prompt: "Use $oswbb-ops to diagnose this OSWbb archive and return evidence-backed next checks."
