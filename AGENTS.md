@@ -1,38 +1,65 @@
-# Repository Guidelines
+# CLAUDE.md
 
-## 项目结构与模块组织
-入口是 `main.go`，负责把 CLI 参数接入 analyzer。核心逻辑在 `pkg/`，按领域划分：
-- `pkg/iostat`、`pkg/meminfo`、`pkg/top`：OSWatcher 日志解析与指标计算。
-- `pkg/processor`：编排流程、时间过滤、analyzer glue。
-- `pkg/output`：report writers（`report`、`html`、`csv`、`json`）。
-- `pkg/common`：共享 types 与 helpers。
-测试与代码同目录，放在 `pkg/**/_test.go`。示例输入和产物位于 `archive/`、`test_log/`、`oswbb.tar.gz`、`*.html`，视为 fixtures，不是源码。
+Behavioral guidelines to reduce common LLM coding mistakes. Merge with project-specific instructions as needed.
 
-## 构建、测试与本地开发命令
-使用 Go 1.23+（参考 `go.mod` toolchain）。
-- `go build -o osw-analyse .`：编译 CLI。
-- `go run . -f /path/to/oswbb/archive -o html`：本地分析并生成 HTML report。
-- `go test ./...`：运行全量测试。
-- `go test ./pkg/iostat -run TestName`：运行指定测试。
+**Tradeoff:** These guidelines bias toward caution over speed. For trivial tasks, use judgment.
 
-## 编码风格与命名规范
-遵循 Go 标准格式化；建议 `go fmt ./...`（或 `gofmt -w`）。文件名使用小写与下划线（如 `analyzer_top.go`）。命名遵循 Go 规范：导出标识符用 `CamelCase`，非导出用 `lowerCamel`。解析包内函数保持小而专注，输出格式集中在 `pkg/output`。
+## 1. Think Before Coding
 
-## 测试指南
-测试基于 Go `testing` 包。测试文件命名为 `*_test.go`，测试函数命名为 `TestXxx`。修改解析逻辑、异常检测阈值或输出格式时应补充/更新测试。优先使用确定性输入（固定时间戳、小型 fixtures）保持稳定性。
+**Don't assume. Don't hide confusion. Surface tradeoffs.**
 
-## 提交与 PR 指南
-近期提交多为简短、描述性消息（常见中文），不要求固定前缀；建议保持动词导向，例如“添加 HTML 输出”。PR 建议包含：
-- 行为变更摘要。
-- 验证命令示例（如 `go test ./...`、`go run . -f ...`）。
-- 若 report 渲染有变化，附示例输出或截图。
+Before implementing:
+- State your assumptions explicitly. If uncertain, ask.
+- If multiple interpretations exist, present them - don't pick silently.
+- If a simpler approach exists, say so. Push back when warranted.
+- If something is unclear, stop. Name what's confusing. Ask.
 
-## 安全与数据处理
-OSWatcher 日志可能包含敏感主机信息。避免提交真实客户日志，新增测试数据请优先使用脱敏或合成 fixtures。
+## 2. Simplicity First
 
-## 对话沟通要求
-- **必须使用中文回复**（技术术语可保留英文）
-- 禁止使用emjoy。
-- 遵循了DRY原则
-  - 提高代码可读性
-  - 减少重复代码
+**Minimum code that solves the problem. Nothing speculative.**
+
+- No features beyond what was asked.
+- No abstractions for single-use code.
+- No "flexibility" or "configurability" that wasn't requested.
+- No error handling for impossible scenarios.
+- If you write 200 lines and it could be 50, rewrite it.
+
+Ask yourself: "Would a senior engineer say this is overcomplicated?" If yes, simplify.
+
+## 3. Surgical Changes
+
+**Touch only what you must. Clean up only your own mess.**
+
+When editing existing code:
+- Don't "improve" adjacent code, comments, or formatting.
+- Don't refactor things that aren't broken.
+- Match existing style, even if you'd do it differently.
+- If you notice unrelated dead code, mention it - don't delete it.
+
+When your changes create orphans:
+- Remove imports/variables/functions that YOUR changes made unused.
+- Don't remove pre-existing dead code unless asked.
+
+The test: Every changed line should trace directly to the user's request.
+
+## 4. Goal-Driven Execution
+
+**Define success criteria. Loop until verified.**
+
+Transform tasks into verifiable goals:
+- "Add validation" → "Write tests for invalid inputs, then make them pass"
+- "Fix the bug" → "Write a test that reproduces it, then make it pass"
+- "Refactor X" → "Ensure tests pass before and after"
+
+For multi-step tasks, state a brief plan:
+```
+1. [Step] → verify: [check]
+2. [Step] → verify: [check]
+3. [Step] → verify: [check]
+```
+
+Strong success criteria let you loop independently. Weak criteria ("make it work") require constant clarification.
+
+---
+
+**These guidelines are working if:** fewer unnecessary changes in diffs, fewer rewrites due to overcomplication, and clarifying questions come before implementation rather than after mistakes.
